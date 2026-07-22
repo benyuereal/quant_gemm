@@ -3,6 +3,8 @@
 本目录是对 sglang (dev 0.0.0.dev12695) 的补丁, 使其能在海光 DCU (gfx936/gfx928)
 上加载并推理 **W8A8 量化 (只量化 MoE expert) 的 MiniMax-M3**.
 
+**状态: BW100 (gfx936) 上 forward 已跑通**, chat/completions 请求成功, 输出连贯.
+
 ## 改动总览
 
 | 文件 | 类型 | 改动 |
@@ -11,7 +13,8 @@
 | `modified/compressed_tensors.py` | 改动 | ① MoE W8A8 海光分支 raise→return 新 scheme; ② Linear W8A8 海光下走 bf16 (moe-only) |
 | `modified/schemes/__init__.py` | 改动 | 导出新 scheme |
 | `modified/int8_kernel.py` | 改动 | `per_token_quant_int8` 的 round: `tl.extra.cuda.libdevice` → `tl.extra.hip.libdevice` |
-| `modified/topk_sparse_prefill.py` | 改动 | MiniMax sparse attn kernel 去掉 `num_stages=3` config (BW100 共享内存 64K 不够) |
+| `modified/topk_sparse_prefill.py` | 改动 | sparse attn **prefill** kernel `num_stages=1` (BW100 共享内存 64K, stages≥2 超 65536) |
+| `modified/topk_sparse_decode.py` | 改动 | sparse attn **decode** kernel `num_stages=1` (同上, decode 阶段也超) |
 
 每个 `modified/*.py.patch` 是相对原始 sglang 的 diff, 可用 `patch -p1 < xxx.patch` 应用.
 `modified/*.py` 是改后的完整文件, 可直接覆盖.
@@ -68,19 +71,35 @@ x_q = tl.extra.hip.libdevice.round(x_q).to(tl.int8)  # 海光镜像专用, 写�
 **注意**: 此改动写死 `tl.extra.hip`, 仅适用于海光 HIP 镜像 (不在 CUDA 跑). 已单独验证
 kernel 跑通, 误差 0.93%.
 
-### 5. `topk_sparse_prefill.py` — sparse attn 共享内存
+### 5. `topk_sparse_prefill.py` — sparse attn prefill 共享内存
 
-MiniMax sparse attention 的 `_gqa_share_sparse_fwd_kernel` autotune 含 `num_stages=3`
-config, 在 BW100 (共享内存上限 65536) 上需 69632 → `OutOfResources`. 去掉
-`num_stages=3` 的两个 config, 只留 `num_stages=2`:
+MiniMax sparse attention **prefill** 的 `_gqa_share_sparse_fwd_kernel` autotune 含
+`num_stages=2/3` config, 在 BW100 (共享内存上限 65536) 上需 69632 → `OutOfResources`.
+实测 `num_stages=2` 仍超 (差 4KB), 必须降到 `num_stages=1`:
 ```python
 configs=[
-    triton.Config({}, num_warps=4, num_stages=2),
-    triton.Config({}, num_warps=8, num_stages=2),  # 原还有 stages=3 的两个, 删
+    triton.Config({}, num_warps=4, num_stages=1),
+    triton.Config({}, num_warps=8, num_stages=1),  # 原为 stages=2/3
 ]
 ```
-**注意**: `decode/flash_with_topk_idx.py` 和 `prefill/flash_with_topk_idx.py` 也有
-`num_stages=3`, 本次未改 (未被 forward 触发). 若后续 decode 阶段报同样错, 同法处理.
+
+### 6. `topk_sparse_decode.py` — sparse attn decode 共享内存
+
+MiniMax sparse attention **decode** 的 `_gqa_share_sparse_decode_kernel` autotune
+`for ns in [2, 3, 4, 5]`, 同样超 BW100 64K. 改为 `for ns in [1]`:
+```python
+configs=[
+    triton.Config({}, num_warps=nw, num_stages=ns)
+    for nw in [4, 8]
+    for ns in [1]  # 原为 [2, 3, 4, 5]
+]
+```
+
+**注意**:
+- `num_stages=1` 偏保守 (无 pipeline), 性能非最优, 但保证跑通. 后续可测算各 kernel 在 64K 内的最大 stages.
+- `decode/flash_with_topk_idx.py` 和 `prefill/flash_with_topk_idx.py` 也有 `num_stages≥3`,
+  本次未改 (forward 未触发). 若报同错同法处理.
+- 改 stages 后**必须清 triton 缓存** (`/models/.triton_cache` 或 `~/.triton`), 否则用旧编译结果.
 
 ## 应用补丁
 
@@ -94,11 +113,20 @@ cp modified/compressed_tensors.py $SG/layers/quantization/compressed_tensors/
 cp modified/schemes___init__.py $SG/layers/quantization/compressed_tensors/schemes/__init__.py
 cp modified/int8_kernel.py $SG/layers/quantization/
 cp modified/topk_sparse_prefill.py $SG/layers/attention/minimax_sparse_ops/prefill/topk_sparse.py
+cp modified/topk_sparse_decode.py $SG/layers/attention/minimax_sparse_ops/decode/topk_sparse.py
+# 清 triton 缓存 (改过 kernel 后必须清)
+rm -rf /models/.triton_cache/* ~/.triton/* /tmp/torchinductor_root
 ```
 
 ## 启动
 
-`/models/minimax.sh` (已配 W8A8 moe-only 模型 + 海光适配参数):
+`/models/minimax.sh` (已配 W8A8 moe-only 模型 + 海光适配参数, 自动停残留+清缓存+日志重定向):
+```bash
+bash /models/minimax.sh
+# 日志: /models/sglang_serve.log (覆盖写)
+# 另开终端: tail -f /models/sglang_serve.log
+```
+等价的手动命令:
 ```bash
 sglang serve --model-path /models/MiniMax/MiniMax-M3-w8a8-moe-only \
   --tp-size 8 --dtype bfloat16 --context-length 4096 --max-total-tokens 4096 \
@@ -106,4 +134,7 @@ sglang serve --model-path /models/MiniMax/MiniMax-M3-w8a8-moe-only \
   --trust-remote-code --skip-server-warmup --disable-cuda-graph \
   --mem-fraction-static 0.85
 ```
-环境变量: `SGLANG_USE_AITER=0` (纯 Triton), `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`.
+环境变量: `SGLANG_USE_AITER=0` (纯 Triton), `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`,
+`TMPDIR/TORCHINDUCTOR_CACHE_DIR/TRITON_CACHE_DIR` 指到 /models (根文件系统可写空间小).
+
+**测试**: `curl -N http://127.0.0.1:8080/v1/chat/completions -H "Content-Type: application/json" -d '{"model":"default","messages":[{"role":"user","content":"你好"}],"max_tokens":64}'`

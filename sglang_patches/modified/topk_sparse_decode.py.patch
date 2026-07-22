@@ -1,0 +1,11 @@
+--- /models/sglang_backup/topk_sparse_decode.py	2026-07-22 11:29:39.780459953 +0800
++++ /usr/local/lib/python3.10/dist-packages/sglang/srt/layers/attention/minimax_sparse_ops/decode/topk_sparse.py	2026-07-22 11:29:48.584209016 +0800
+@@ -24,7 +24,7 @@
+     configs=[
+         triton.Config({}, num_warps=nw, num_stages=ns)
+         for nw in [4, 8]
+-        for ns in [2, 3, 4, 5]
++        for ns in [1]
+     ],
+     key=["BATCH_SIZE_BUCKET", "gqa_group_size", "head_dim", "block_size", "HAS_SINK"],
+ )

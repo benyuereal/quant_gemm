@@ -26,8 +26,8 @@ from ..common.utils import get_cu_seqblocks, robust_allocator
 )
 @triton.autotune(
     configs=[
-        triton.Config({}, num_warps=4, num_stages=2),
-        triton.Config({}, num_warps=8, num_stages=2),
+        triton.Config({}, num_warps=4, num_stages=1),
+        triton.Config({}, num_warps=8, num_stages=1),
     ],
     key=[
         "BLOCK_SIZE_Q",
