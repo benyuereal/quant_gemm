@@ -532,7 +532,106 @@ GitHub 仓库：https://github.com/benyuereal/quant_gemm （含 quant_gemm 算�
 关键发现：sglang 原生 `fused_moe_kernel`（Triton）**已支持 `use_int8_w8a8` + `per_channel_quant`**，缺的只是一个 MoE scheme 接上海光分支。
 故**不用** quant_gemm 的 MoE kernel（备份方案），而是新写 scheme 复用 sglang Triton runner——能复用 sglang 全套 MoE 基础设施（路由、combine、a2a），工作量小得多。
 
-## 十五、sglang 缺口梳理（gfx936/gfx928）
+## 十五、量化过程：W8A8 moe-only 怎么做的
+
+> 本章讲最终跑通的 W8A8 量化全过程：脚本怎么量化、模型怎么适配 config、产物怎么验证。
+> （第三章的 W4A8 int4 方案是早期探索，已被 W8A8 int8 取代，保留作历史。）
+
+### 15.1 量化方案
+
+- **W8A8**：权重 per-channel int8（对称，qmax=127），激活 per-token int8（dynamic，运行时量化）。
+- **只量化 MoE expert**（`block_sparse_moe.experts.*.w1/w2/w3`，占 96.7% 权重 826GB）。
+- 其余全部留 bf16：attention（q/k/v/o/index_q/index_k_proj）、shared_experts、dense mlp（前3层）、lm_head、embed_tokens、vision_tower、norm、routing gate、MTP。
+- 理由：MoE expert 是大块权重、对量化不敏感；routing/attention 留 bf16 精度更稳（routing gate 量化会破坏专家选择）。
+- 体积：796GB → **412GB**（约 1.9× 压缩，核心收益来自 MoE expert 826GB→413GB）。
+
+### 15.2 量化脚本
+
+脚本：`/models/llm-compressor/examples/one_click_quant/templates/minimax_m3_w4a8.py`（手写，不依赖 llmcompressor——海光容器装 llmcompressor 会搞坏环境，见第十二章）。
+
+```bash
+python3 minimax_m3_w4a8.py \
+    --input-path /models/MiniMax/MiniMax-M3 \
+    --output-path /models/MiniMax/MiniMax-M3-w8a8-moe-only \
+    --quant-type int8 \
+    --moe-only
+```
+
+封装：`/models/quantize_minimax_m3_w4a8.sh`（8 卡并行）。
+
+**量化算法**（`weight_quant_int8`，per-channel 对称）：
+```python
+absmax = w.abs().amax(dim=1, keepdim=True).clamp(min=1e-8)  # 每 output channel 一个
+scale = absmax / 127.0
+q = round(w / scale).clamp(-128, 127).to(int8)             # [N,K] int8
+# 存 q + scale（scale [N,1] f32）
+```
+
+**`--moe-only` 逻辑**（脚本里加的，worker 函数）：
+```python
+if moe_only and ".block_sparse_moe.experts." not in weight_name:
+    # 非 MoE expert 一律保留 bf16，跳过量化
+    new_state_dict[weight_name] = weight; continue
+# 只有 MoE expert 走 weight_quant_int8
+```
+
+**多 GPU 并行**：`mp.spawn`，59 个 safetensor shard 按 `rank::world_size` 分给 8 卡，每卡加载自己的 shard → 量化 → 存回。3D MoE 权重 `[E,N,K]` reshape 成 2D `[E*N, K]` 量化再 reshape 回 `[E, N, K_out]`。
+
+### 15.3 模型适配：config.json 怎么让 sglang 认
+
+产物 `config.json` 的 `quantization_config`（compressed-tensors 格式，sglang/vLLM 原生支持）：
+```json
+{
+  "quant_method": "compressed-tensors",
+  "format": "int-quantized",
+  "config_groups": {
+    "group_0": {
+      "weights": {"num_bits": 8, "type": "int", "strategy": "channel", "symmetric": true, "dynamic": false},
+      "input_activations": {"num_bits": 8, "type": "int", "strategy": "token", "symmetric": true, "dynamic": true},
+      "targets": ["Linear"]
+    }
+  },
+  "ignore": [ /* 17 条正则, 见下 */ ]
+}
+```
+
+**关键适配点：targets + ignore 配合实现"只量化 MoE"**
+
+- `targets: ["Linear"]` 按模块类型匹配——所有 Linear 默认走 W8A8 scheme。
+- `ignore` 用正则把**非 MoE 的 Linear**排除，让它们走 unquantized（bf16）：
+  - 原始 ignore（通用，13 条）：`norm`、`embed_tokens`、`lm_head`、`block_sparse_moe.gate.weight`（routing gate，敏感）、`e_score_correction_bias`、`multi_modal_projector`、`patch_merge_mlp`、`visual`/`vision`、`mtp`、各 `qk_norm` 等。
+  - `--moe-only` 额外 ignore（4 条，`MOE_ONLY_EXTRA_IGNORE`）：
+    ```
+    re:.*self_attn\.(q_proj|k_proj|v_proj|o_proj|index_q_proj|index_k_proj)(\.weight)?$
+    re:.*block_sparse_moe\.shared_experts\.(gate_proj|up_proj|down_proj)(\.weight)?$
+    re:.*mlp\.(gate_proj|up_proj|down_proj)(\.weight)?$
+    ```
+- **ignore 正则的坑**（踩坑 3）：sglang 匹配 ignore 时用**不带 `.weight`** 的 module name，所以正则里 `.weight` 要写成可选 `(\.weight)?`，不能强制 `\.weight$`（否则匹配不到，非 MoE Linear 会被误量化，加载时 `Unsupported copy between dtypes` 报错）。
+
+**权重命名映射**（sglang 加载时处理，不用改产物）：
+- 产物里 MoE expert 叫 `block_sparse_moe.experts.*.w1/w2/w3`（MiniMax 原始命名）。
+- sglang 内部用 `gate_proj/up_proj/down_proj`，加载时通过 `ckpt_gate_proj_name="w1"` 等映射（`minimax_m3.py` 的 `make_expert_params_mapping`）。
+- sglang `get_moe_scheme` 用 `.0.gate_proj` 匹配 expert → 命中 W8A8 scheme → 走海光 MoE scheme（补丁 1）。
+
+### 15.4 量化产物验证
+
+产物：`/models/MiniMax/MiniMax-M3-w8a8-moe-only`（412GB，59 shard + config.json + index.json）。
+
+验证三项（全通过）：
+
+1. **config 格式**：compressed-tensors W8A8，8bit channel weight + 8bit token dynamic act，ignore 17 条覆盖非 MoE Linear。✅
+2. **权重 dtype**（单 shard 抽查）：
+   - MoE expert `experts.0.w1.weight`：`int8 [3072,6144]` + `w1.weight_scale`：`float32 [3072,1]`（per-channel）✅
+   - shared_experts / attn / norm：`bfloat16`（moe-only 生效，未量化）✅
+3. **量化精度**（真实 expert 反量化 vs 原始 bf16）：平均相对误差 **1.02%**，余弦相似度 **1.0000** ✅（W8A8 per-channel 正常范围）。
+
+### 15.5 量化耗时
+
+8 卡 BW100 并行，59 shard，约 **3 分钟**完成（比预估 30-60 分钟快很多，因为 moe-only 下非 MoE 层直接拷贝 bf16 不算，只 MoE expert 做 int8 量化）。
+
+---
+
+## 十六、sglang 缺口梳理（gfx936/gfx928）
 
 | 算子类 | sglang 现状 | 缺口 | 解法 |
 |---|---|---|---|
@@ -544,7 +643,7 @@ GitHub 仓库：https://github.com/benyuereal/quant_gemm （含 quant_gemm 算�
 
 **关键发现**：sglang dev 版对海光支持比预期好——`_use_aiter = SGLANG_USE_AITER and _is_hip` 已支持 aiter 跑 MoE；`CompressedTensorsWNA16TritonMoE`（W4A16/W8A16）海光走 Triton 可用。真正缺的是 W8A8 的 Linear 底层算子和 MoE scheme。
 
-## 十六、改了 sglang 哪里（6 处补丁）
+## 十七、改了 sglang 哪里（6 处补丁）
 
 补丁归档：`/models/quant_gemm_pkg/sglang_patches/`（含改后文件 + .patch + README），已 push GitHub。
 
@@ -578,7 +677,7 @@ GitHub 仓库：https://github.com/benyuereal/quant_gemm （含 quant_gemm 算�
 
 MiniMax sparse attention 的 `_gqa_share_sparse_fwd_kernel`（prefill）和 `_gqa_share_sparse_decode_kernel`（decode）autotune 含 `num_stages≥2`，BW100 共享内存上限 65536，需 69632 → `OutOfResources`。实测 stages=2 仍超（差 4KB），必须 `num_stages=1`。
 
-## 十七、踩过的坑（sglang 适配阶段，按顺序）
+## 十八、踩过的坑（sglang 适配阶段，按顺序）
 
 1. **scheme 缺口**：`get_moe_scheme` W8A8 海光 raise → 新写 scheme
 2. **w13 权重布局**：`IndexError start out of range` → 对照 NPU 版修正 scale `[E,N,1]` + `quant_method=CHANNEL`
@@ -593,7 +692,7 @@ MiniMax sparse attention 的 `_gqa_share_sparse_fwd_kernel`（prefill）和 `_gq
 11. **sparse attn 共享内存（decode）**：`num_stages=2~5` 同样超 → `num_stages=1`
 12. **Triton 缓存复用旧编译**：改 stages 后不清缓存会用旧 69632 结果 → minimax.sh 启动前自动清缓存
 
-## 十八、验证进展（按时间）
+## 十九、验证进展（按时间）
 
 | 阶段 | 结果 |
 |---|---|
@@ -606,7 +705,7 @@ MiniMax sparse attention 的 `_gqa_share_sparse_fwd_kernel`（prefill）和 `_gq
 | decode（forward_decode） | ✅ 跑通（修 decode sparse kernel stages 后） |
 | **端到端生成（chat/completions）** | ✅ 返回连贯中文，量化无质量退化 |
 
-## 十九、工时预估与实际
+## 二十、工时预估与实际
 
 ### 19.1 事前预估（只量化 MoE 方案）
 
@@ -621,7 +720,7 @@ MiniMax sparse attention 的 `_gqa_share_sparse_fwd_kernel`（prefill）和 `_gq
 
 实际走"复用 sglang 原生 Triton MoE kernel"路径（而非自写 tilelang MoE 接 sglang），省了工作块 1 的大部分（fuse swiglu/路由对齐由 sglang runner 处理）。主要工作量在**联调阶段排查 12 个坑**（尤其 sparse attn 共享内存、磁盘、Triton 缓存）。整体约 1-2 天跑通（含前期 tilelang 算子验证 + 量化 + sglang 补丁）。
 
-## 二十、安装包与测试目录
+## 二十一、安装包与测试目录
 
 ### 20.1 安装包 `quant_gemm`（`/models/quant_gemm_pkg/`）
 
@@ -651,7 +750,7 @@ quant_gemm_pkg/
 | `test_aiter_w8a8_gfx928.py` | aiter 三条路 gfx928 验证脚本 |
 | `test_minimax_m3_single_shard.py` | 量化产物单 shard 格式校验 |
 
-## 二十一、启动与测试
+## 二十二、启动与测试
 
 ### 21.1 启动
 
@@ -670,7 +769,7 @@ curl -N http://127.0.0.1:8080/v1/chat/completions -H "Content-Type: application/
   -d '{"model":"default","messages":[{"role":"user","content":"用中文写一首关于秋天的短诗"}],"max_tokens":200}'
 ```
 
-## 二十二、环境备忘（更新）
+## 二十三、环境备忘（更新）
 
 - 海光 dtk：`/opt/dtk`，rocm_version 26.04
 - 开发机：8× BW100 (gfx936)，HIP 6.3.26113，torch 2.9.0；部署目标：gfx928 (K100)
@@ -686,7 +785,7 @@ curl -N http://127.0.0.1:8080/v1/chat/completions -H "Content-Type: application/
 - GitHub：https://github.com/benyuereal/quant_gemm
 - **绝不能在 sglang 容器装 llmcompressor**（会升级海光定制 torch 致环境崩，见第十二章）
 
-## 二十三、tilelang 写法备忘（踩过的坑）
+## 二十四、tilelang 写法备忘（踩过的坑）
 
 - 条件控制流：`T.If`/`T.Else`（大写上下文管理器），不是 `T.if_`；循环 `T.Serial` 不是 `T.serial`
 - 避开 kernel 内控制流：路由表 Python 端预算传入，kernel 直接索引（比 T.If 查找 expert 稳）
@@ -696,7 +795,7 @@ curl -N http://127.0.0.1:8080/v1/chat/completions -H "Content-Type: application/
 - `@tilelang.jit(out_idx=[N])`：N 是输出 tensor 在参数列表的 0-based 位置，数错报 "ndim expected X but got Y"
 - grouped_gemm_fwd_ptr 指针表路径 "not stable"，不要用；用分组连续布局 + group_offsets
 
-## 二十四、待办
+## 二十五、待办
 
 - [ ] **gfx928 实测**：全部补丁在 gfx928 (K100) 上重测（BW100 验证 ≠ gfx928 一定通；gfx928 共享内存可能不同）
 - [ ] thinking 模式处理：输出含 `<mm:think>` 思考过程，若需直接出结果要调 chat template 或参数
