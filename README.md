@@ -77,3 +77,39 @@ HIP_VISIBLE_DEVICES=0 python3 /models/test/test_quant_gemm_package.py
 ## gfx928 实测
 
 tilelang 架构无关, gfx936 通过 ≈ gfx928 可 JIT. **需在 gfx928 实机验证** (Triton/tilelang 对 gfx928 MMAC lowering 偶有边界问题).
+
+## 项目结构
+
+本仓库含 MiniMax-M3 在海光 DCU 上 W8A8 量化推理的完整链路:
+
+```
+quant_gemm_pkg/
+├── quant_gemm/          # tilelang W8A8 算子包 (备份方案, sglang 适配未直接用)
+│   ├── kernels.py       #   w8a8_per_channel_gemm, moe_w8a8_grouped_gemm
+│   ├── quant.py         #   per_token/per_channel int8 量化工具
+│   └── api.py           #   w8a8_linear, w8a8_moe 高层 API
+├── sglang_patches/      # sglang 6 处补丁 (海光 W8A8 MoE 适配, forward 已跑通)
+│   ├── added/           #   新增 W8A8 MoE scheme
+│   └── modified/        #   5 处改动 (compressed_tensors/int8_kernel/sparse attn 等)
+├── quantization/        # 量化脚本
+│   ├── minimax_m3_w4a8.py       # 量化主脚本 (--quant-type int8 --moe-only)
+│   ├── quantize_minimax_m3_w4a8.sh  # 8 卡并行封装
+│   ├── minimax.sh               # sglang 启动脚本
+│   └── glm5.1-...config.json    # 参考 config
+└── docs/
+    └── MiniMax-M3-量化工作记录.md  # 完整工作记录 (W4A8 探索 → W8A8 跑通, 25 章)
+```
+
+## 完整流程
+
+1. **量化**: `bash quantization/quantize_minimax_m3_w4a8.sh` → 412GB W8A8 moe-only 产物
+2. **打 sglang 补丁**: 按 `sglang_patches/README.md` 应用 6 处补丁
+3. **启动**: `bash quantization/minimax.sh` → sglang serve on :8080
+4. **测试**: `curl http://127.0.0.1:8080/v1/chat/completions ...`
+
+详见 `docs/MiniMax-M3-量化工作记录.md`。
+
+## 状态
+
+- ✅ BW100 (gfx936): 量化 + sglang 适配 + forward 跑通, chat/completions 返回连贯中文
+- ⏳ gfx928 (K100): 待实测 (lightop 无 gfx928 产物, 用 tilelang/Triton 路径)
