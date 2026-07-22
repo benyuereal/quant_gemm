@@ -807,3 +807,171 @@ curl -N http://127.0.0.1:8080/v1/chat/completions -H "Content-Type: application/
 - [ ] stages 精调：当前全 stages=1 偏保守，可测算各 kernel 在 64K 内的最优 stages
 - [ ] 端到端质量对比：W8A8 moe-only vs bf16 原模型，生成质量/perplexity
 - [ ] W4A8（可选，省显存到 224GB）：tilelang `dequantize_gemm/example_dequant_gemm_w4a8.py` + scale 注入，需解决 int4 打包格式对齐
+
+---
+
+## 二十六、W4A16 moe-only 量化（进行中）
+
+### 26.1 为什么做 W4A16
+
+W8A8 moe-only 每卡权重 52GB（TP8），上下文余量有限（单请求约 64K）。
+W4A16 把 MoE expert 从 int8 进一步压到 int4，权重再省一半：
+
+| 方案 | 每卡权重(TP8) | 单请求上下文余量 |
+|---|---|---|
+| bf16 原版 | ~99GB（放不下） | — |
+| W8A8 moe-only | 52GB | ~64K |
+| **W4A16 moe-only** | **~28GB** | **~256K** |
+| cyankiwi AWQ INT4（g=32+校准） | ~26GB | ~256K |
+
+activation 仍为 bf16（A16），所以 sglang 走 W4A16 Triton 路径，不需要 W4A8 那种自定义 kernel。
+
+### 26.2 量化方案
+
+- **只量化 MoE routed expert**（`block_sparse_moe.experts.*.w1/w2/w3`）为 int4
+- W4A16 preset：weights num_bits=4, strategy=group, **group_size=128**, symmetric, **无 activation 量化**
+- observer=`memoryless_minmax`（**naive 无校准**，data-free）
+- 其余全部 bf16：attn / shared_experts / dense mlp / gate / norm / embed / lm_head / vision / mtp
+- 产物格式：compressed-tensors `pack-quantized`（`weight_packed` int32 + `weight_scale` + `weight_shape`），sglang 原生识别
+
+### 26.3 量化脚本与产物
+
+- 脚本：`/models/llm-compressor/examples/one_click_quant/templates/minimax_m3_w4a16.py`（标准 `model_free_ptq` 接口，data-free）
+- 产物：`/models/MiniMax/MiniMax-M3-w4a16-moe-only`
+- 大小：**225GB**（原 bf16 796GB，压缩 3.55×）
+- 耗时：6分30秒（4卡：GPU 0/1/4/5，`--max-workers 4`）
+
+**量化时踩的坑：**
+- 首次用 8 卡跑，GPU6/7 被 AWQ 下载器占用 → `torch.OutOfMemoryError: HIP out of memory`（抢显存）
+- 解法：`CUDA_VISIBLE_DEVICES` 限定只用空闲卡，worker 数 = 卡数。8卡被占时改用 4 卡（0,1,4,5），稳定完成
+
+**产物权重布局（已验证）：**
+```
+expert w1: weight_packed [3072, 768] int32  (= [N, K//8], 8×int4 打包进 int32)
+           weight_scale  [3072, 48]  bf16   (= [N, K//128], group_size=128)
+           weight_shape   [2] int64
+expert w2: weight_packed [6144, 384] int32  (= [N, K//8])
+           weight_scale  [6144, 24]  bf16
+非expert:  gate.weight fp32, shared_experts.*.weight bf16（保持原精度）
+```
+
+### 26.4 显存账（决定 TP 数）
+
+每卡 64GB（BW100，可用 ~67GB）。MoE expert 按 expert 切分（EP）：
+
+| TP | 每卡 expert | 每卡非expert | 每卡权重合计 | 评价 |
+|---|---|---|---|---|
+| 4 | 53.3GB | 9.0GB | **62.2GB** | 极限，KV 几乎没空间，只能短上下文 |
+| 6 | 35.5GB | 6.7GB | 42.2GB | 宽裕，但 **128÷6 不整除，sglang 报错** |
+| 8 | 26.6GB | 5.5GB | 32.1GB | 最优（需 8 卡） |
+
+**硬限制：sglang 要求 `num_experts % ep_size == 0`**（`topk.py:1270` / `fused_moe_triton/layer.py:215`）。
+128 的约数只有 1/2/4/8/16/32/64/128 → **TP 只能选 4 或 8**（当前 6 卡空闲时只能用 4）。
+
+### 26.5 sglang 加载：踩了三个坑（核心）
+
+加载自己的 W4A16 产物，目标走 sglang 原生 `CompressedTensorsWNA16TritonMoE`（hip Triton 路径，非 marlin）。
+
+**坑 1：`Unable to find matching target for ...self_attn.qkv_proj`**
+- 原因：config.json 的 `ignore` 没覆盖 `self_attn`/`shared_experts`/dense `mlp`。compressed-tensors 要求每个 Linear **要么被 targets 命中（量化），要么被 ignore 命中（bf16）**，两边都没匹配就报错
+- 修复：ignore 补 `self_attn`、`shared_experts`、dense `mlp.(gate|up|down|gate_up)_proj`
+
+**坑 2：`Unable to find matching target for ...mlp.experts.0.gate_proj`**
+- 原因：**权重文件名（HF 原名 `block_sparse_moe.experts.0.w1`）≠ sglang 内部层名（`mlp.experts.0.gate_proj`）**。sglang 加载时通过 weight_loader 映射（`w1→gate_proj`、`block_sparse_moe→mlp`，见 `minimax_m3.py:1184` `ckpt_gate_proj_name="w1"`），**compressed-tensors 的 target/ignore 匹配用的是映射后的 sglang 名**
+- 修复：config.json 的 `targets` 和 `ignore` 全部改用 **sglang 层名**：
+  - targets: `re:.*\.mlp\.experts\.\d+\.(gate|up|down)_proj$`
+  - ignore: `mlp.gate` / `mlp.shared_experts.*` / `self_attn.*` / `mlp.(gate|up|down|gate_up)_proj` / norm / embed / lm_head / vision / mtp
+- 验证：正则边界正好分开 expert（`mlp.experts.N.gate_proj`）和 dense mlp（`mlp.gate_proj`）——`\.mlp\.` 后紧跟 `gate_proj` 才命中 dense，expert 中间隔了 `experts.N` 不命中
+
+**坑 3：`KeyError: 'Linear'`**（`compressed_tensors_wNa16_moe.py:61`）
+- 原因：`CompressedTensorsWNA16MoE.__init__` 硬编码 `target_scheme_map["Linear"]`，期望 config 用模块类名 `targets:["Linear"]`（像 cyankiwi AWQ）。我们用正则层名 target，`target_scheme_map` 键是正则字符串，没有 `"Linear"` 键
+- 修复（sglang 源码补丁 7）：改成兼容正则 target——`"Linear"` 在则用它，否则取 map 第一个 scheme
+- 备选方案（未采用）：config 改 `targets:["Linear"]` + ignore 排除所有非 expert Linear，但风险是漏排一个 Linear 就被误量化
+
+### 26.6 sglang 源码补丁 7（W4A16 新增）
+
+文件：`/usr/local/lib/python3.10/dist-packages/sglang/srt/layers/quantization/compressed_tensors/schemes/compressed_tensors_wNa16_moe.py`
+
+`CompressedTensorsWNA16MoE.__init__` 第 61 行：
+```python
+# 改前
+config = self.quant_config.target_scheme_map["Linear"].get("weights")
+# 改后
+_scheme_map = self.quant_config.target_scheme_map
+if "Linear" in _scheme_map:
+    config = _scheme_map["Linear"].get("weights")
+else:
+    config = next(iter(_scheme_map.values())).get("weights")
+```
+作用：让 compressed-tensors 支持用**正则层名**做 target（只量 MoE expert），不强制 `targets:["Linear"]`。hip 上 `CompressedTensorsWNA16TritonMoE` 继承此类，同样生效。
+
+### 26.7 启动脚本（已跑通）
+
+`/models/minimax_w4a16.sh`（4 卡验证版）。经多轮调参最终跑通的参数：
+```bash
+export CUDA_VISIBLE_DEVICES=0,1,4,5   # 4张均衡空闲卡(2/3/6/7被占)
+sglang serve \
+    --model-path /models/MiniMax/MiniMax-M3-w4a16-moe-only \
+    --mem-fraction-static 0.97 \   # 关键: 权重占92%,frac要>0.93才不让KV公式算负
+    --tp-size 4 \                  # 128÷4=32 整除
+    --dtype bfloat16 \
+    --context-length 512 \         # 开cuda graph后KV被挤,上下文调小
+    --max-total-tokens 512 \
+    --chunked-prefill-size 512 \
+    --cuda-graph-max-bs 8 \        # 只capture bs≤8, 额外~0.6GB/卡
+    --attention-backend triton \
+    --mm-attention-backend triton_attn \
+    --trust-remote-code --skip-server-warmup \
+    --host 0.0.0.0 --port 8081
+```
+
+**关键调参过程（`mem-fraction-static` 不是直觉的"调高=KV大"）：**
+- sglang 公式：`rest_memory = 加载后空闲 - 加载前空闲 × (1 - mem_fraction_static)`
+- 实测：加载前 62GB，加载后只剩 **4.82GB**（权重 57.25GB/卡）
+- frac=0.55 → rest = 4.82 - 62×0.45 = **-23GB** → `Not enough memory`
+- frac=0.92 → rest = -0.14GB（仍负）
+- frac=0.95 → rest = 1.72GB（正，不开 cuda graph 时用这个，context=1024 跑通）
+- frac=0.97 → rest = 2.96GB（开 cuda graph 时用，context=512）
+- **本质**：frac 表达"加载前预留给 KV 的比例"，权重几乎占满时必须接近 0.92+ 才让公式算正；真正 KV 分配看加载后实际剩余
+
+**4 卡启动额外坑：`The memory capacity is unbalanced`**
+- sglang 检查各卡加载前空闲显存，若某卡 < 其他卡×0.9 则拒绝启动
+- `CUDA_VISIBLE_DEVICES=0,1,2,3` 时 GPU2/3 只 59GB（被占 8GB），0/1 有 67GB → 不均衡
+- 解法：选显存均衡的 4 张卡（0,1,4,5 均 67GB）
+
+### 26.8 4 卡上下文与 cuda graph 显存测算
+
+**4 卡 TP=4 上下文容量**（每卡加载后剩 4.72GB）：
+- 每 token 每卡 KV = 2(K+V) × 1 kv_head(GQA 4头÷4卡) × 128 head_dim × 67层 × 2字节 ≈ **33.5 KB**
+- 不开 cuda graph（KV 预算 ~1.7GB）：单请求 **~51K tokens**
+- 开 cuda graph bs≤8（KV 预算 ~0.7GB）：单请求 **~21K tokens**
+- 理论极限（留 1.5GB 激活，其余全 KV）：**~94K tokens**（但 prefill 激活会先 OOM）
+
+**cuda graph 额外显存**（sglang 公式 `reserved = chunked_prefill×1.5 + cuda_graph_max_bs×2` GB）：
+| cuda_graph_max_bs | 额外显存/卡 |
+|---|---|
+| 8 | ~0.6 GB |
+| 80（TP4 默认） | ~1.0 GB |
+| 160 | ~1.3 GB |
+
+**结论：4 卡显存极限下 cuda graph 不划算**——bs≤8 占 0.6GB 挤压 KV（51K→21K），且 capture 峰值可能 OOM。cuda graph 真正适合 **8 卡 TP=8**（每卡剩 35GB，扣 1GB 无压力）。4 卡验证阶段用 bs≤8 做功能验证。
+
+### 26.9 验证进展
+
+- [x] 量化完成，产物 225GB，权重布局正确
+- [x] config.json targets/ignore 修复（sglang 层名）
+- [x] sglang 源码补丁 7（KeyError 'Linear'）
+- [x] 日志确认进入 `Using CompressedTensorsWNA16TritonMoE (ROCm)` + `Falling back to UnquantizedLinearMethod`（非expert走bf16）
+- [x] **4 卡加载成功**：`Load weight end. avail mem=4.82 GB, mem usage=57.25 GB`，`The server is fired up and ready to roll!`（port 8081, frac=0.95, context=1024, 不开cuda graph）
+- [x] `mem-fraction-static` 调参公式摸清（>0.93 才不报 Not enough memory）
+- [ ] cuda graph bs≤8 capture 是否成功（待验证，可能踩 W8A8 同款 `__nv_roundf`/shared mem 坑）
+- [ ] forward 跑通 + 生成质量
+- [ ] 端到端评测（MMLU/GPQA），与 cyankiwi AWQ、bf16 对比
+
+### 26.9 关键认知（关于"校准"与"12.88%"）
+
+- **naive int4 必须校准才能恢复精度**：RTN/min-max 被 outlier 拖累，我们自己 data-free 量化的 W4A16 是 naive（observer=memoryless_minmax），**精度预期不如校准过的**
+- **"12.88%" 站不住脚**：该数字无评测记录，是权重/中间层误差的中间度量，非端到端精度，不能代表真实任务得分
+- **MiniMax-M3 自己校准跑不通**：无 HF modeling 文件，`AutoModelForCausalLM` 加载失败，AutoAWQ/llmcompressor 校准无法进行
+- **cyankiwi AWQ 是现成校准产物**：`observer=mse`（真AWQ校准）+ group=32 + MoE量化 + 敏感层保bf16，sglang 原生可加载，作为有校准基准对比用
+- 本次自做 W4A16 moe-only 目的：验证 naive int4 moe-only 在 sglang 上能否加载+跑通，并与校准版客观对比（需搭端到端评测）

@@ -1,9 +1,12 @@
-# sglang 补丁 — 海光 DCU W8A8 MoE 适配
+# sglang 补丁 — 海光 DCU W8A8 / W4A16 MoE 适配
 
 本目录是对 sglang (dev 0.0.0.dev12695) 的补丁, 使其能在海光 DCU (gfx936/gfx928)
-上加载并推理 **W8A8 量化 (只量化 MoE expert) 的 MiniMax-M3**.
+上加载并推理 **W8A8 与 W4A16 量化 (只量化 MoE expert) 的 MiniMax-M3**.
 
-**状态: BW100 (gfx936) 上 forward 已跑通**, chat/completions 请求成功, 输出连贯.
+**状态:**
+- **W8A8 moe-only**: BW100 (gfx936) 上 forward 已跑通, chat/completions 请求成功, 输出连贯.
+- **W4A16 moe-only**: BW100 (gfx936) 上 sglang 加载成功 (`The server is fired up and ready to roll!`),
+  走 `CompressedTensorsWNA16TritonMoE (ROCm)` 纯 Triton 路径. 补丁 1-6 为 W8A8, 补丁 7 为 W4A16.
 
 ## 改动总览
 
@@ -15,6 +18,7 @@
 | `modified/int8_kernel.py` | 改动 | `per_token_quant_int8` 的 round: `tl.extra.cuda.libdevice` → `tl.extra.hip.libdevice` |
 | `modified/topk_sparse_prefill.py` | 改动 | sparse attn **prefill** kernel `num_stages=1` (BW100 共享内存 64K, stages≥2 超 65536) |
 | `modified/topk_sparse_decode.py` | 改动 | sparse attn **decode** kernel `num_stages=1` (同上, decode 阶段也超) |
+| `modified/compressed_tensors_wNa16_moe.py` | 改动 | **W4A16**: `CompressedTensorsWNA16MoE.__init__` 兼容正则层名 target, 不再硬编码 `target_scheme_map["Linear"]` (否则 `KeyError: 'Linear'`) |
 
 每个 `modified/*.py.patch` 是相对原始 sglang 的 diff, 可用 `patch -p1 < xxx.patch` 应用.
 `modified/*.py` 是改后的完整文件, 可直接覆盖.
@@ -138,3 +142,39 @@ sglang serve --model-path /models/MiniMax/MiniMax-M3-w8a8-moe-only \
 `TMPDIR/TORCHINDUCTOR_CACHE_DIR/TRITON_CACHE_DIR` 指到 /models (根文件系统可写空间小).
 
 **测试**: `curl -N http://127.0.0.1:8080/v1/chat/completions -H "Content-Type: application/json" -d '{"model":"default","messages":[{"role":"user","content":"你好"}],"max_tokens":64}'`
+
+---
+
+## W4A16 补丁
+
+### 7. `compressed_tensors_wNa16_moe.py` — 兼容正则层名 target (W4A16)
+
+**背景**: sglang `CompressedTensorsWNA16MoE.__init__` 硬编码
+`self.quant_config.target_scheme_map["Linear"].get("weights")`, 期望 config 用模块类名
+`targets:["Linear"]` (像社区 AWQ 模型). 但我们 moe-only 量化产物用**正则层名**做 target
+(`re:.*\.mlp\.experts\.\d+\.(gate|up|down)_proj$`, 只量 MoE expert), 此时
+`target_scheme_map` 的键是该正则字符串, 没有 `"Linear"` 键 → `KeyError: 'Linear'`.
+
+**做法**: `"Linear"` 在则用它, 否则取 `target_scheme_map` 第一个 (通常也是唯一一个) scheme:
+```python
+_scheme_map = self.quant_config.target_scheme_map
+if "Linear" in _scheme_map:
+    config = _scheme_map["Linear"].get("weights")
+else:
+    config = next(iter(_scheme_map.values())).get("weights")
+```
+hip 上 `CompressedTensorsWNA16TritonMoE` 继承此类, 同样生效.
+
+**为什么不用 `targets:["Linear"]` + ignore 排除**: `"Linear"` 会声明所有 Linear 都量化,
+moe-only 下漏排一个非 expert Linear (attn/dense mlp/shared) 就会被当 int4 加载但权重是 bf16 → 报错.
+正则层名 target 语义精确 (只量 expert), 此补丁让 sglang 接受这种写法.
+
+**配套的 config.json 调整 (非 sglang 代码, 是量化产物配置)**:
+- `targets` 必须用 **sglang 层名** (`mlp.experts.*`), 不是 HF 权重名 (`block_sparse_moe.experts.*`).
+  sglang 加载时通过 weight_loader 映射 `w1→gate_proj`/`block_sparse_moe→mlp`,
+  compressed-tensors 的 target/ignore 匹配用**映射后的 sglang 名**.
+- `ignore` 要覆盖所有非 expert Linear (`self_attn.*` / `mlp.shared_experts.*` /
+  `mlp.(gate|up|down|gate_up)_proj` / `mlp.gate` / norm / embed / lm_head / vision / mtp),
+  否则报 `Unable to find matching target for ...`.
+
+详见工作文档 `docs/MiniMax-M3-量化工作记录.md` 第二十六章 26.5 (三个坑) / 26.6 (本补丁).

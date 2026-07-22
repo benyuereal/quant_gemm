@@ -88,28 +88,37 @@ quant_gemm_pkg/
 │   ├── kernels.py       #   w8a8_per_channel_gemm, moe_w8a8_grouped_gemm
 │   ├── quant.py         #   per_token/per_channel int8 量化工具
 │   └── api.py           #   w8a8_linear, w8a8_moe 高层 API
-├── sglang_patches/      # sglang 6 处补丁 (海光 W8A8 MoE 适配, forward 已跑通)
+├── sglang_patches/      # sglang 7 处补丁 (海光 W8A8/W4A16 MoE 适配)
 │   ├── added/           #   新增 W8A8 MoE scheme
-│   └── modified/        #   5 处改动 (compressed_tensors/int8_kernel/sparse attn 等)
+│   └── modified/        #   6 处改动 (compressed_tensors/int8_kernel/sparse attn/wNa16_moe)
 ├── quantization/        # 量化脚本
-│   ├── minimax_m3_w4a8.py       # 量化主脚本 (--quant-type int8 --moe-only)
+│   ├── minimax_m3_w4a8.py       # W8A8 量化主脚本 (--quant-type int8 --moe-only)
+│   ├── minimax_m3_w4a16.py      # W4A16 量化脚本 (model_free_ptq, 只量 MoE expert)
 │   ├── quantize_minimax_m3_w4a8.sh  # 8 卡并行封装
-│   ├── minimax.sh               # sglang 启动脚本
+│   ├── minimax.sh               # W8A8 sglang 启动脚本
+│   ├── minimax_w4a16.sh         # W4A16 sglang 启动脚本 (4卡验证版)
 │   └── glm5.1-...config.json    # 参考 config
 └── docs/
-    └── MiniMax-M3-量化工作记录.md  # 完整工作记录 (W4A8 探索 → W8A8 跑通, 25 章)
+    └── MiniMax-M3-量化工作记录.md  # 完整工作记录 (W4A8 探索 → W8A8 → W4A16, 26 章)
 ```
 
 ## 完整流程
 
+**W8A8:**
 1. **量化**: `bash quantization/quantize_minimax_m3_w4a8.sh` → 412GB W8A8 moe-only 产物
-2. **打 sglang 补丁**: 按 `sglang_patches/README.md` 应用 6 处补丁
+2. **打 sglang 补丁**: 按 `sglang_patches/README.md` 应用补丁 1-6
 3. **启动**: `bash quantization/minimax.sh` → sglang serve on :8080
 4. **测试**: `curl http://127.0.0.1:8080/v1/chat/completions ...`
+
+**W4A16:**
+1. **量化**: `python3 quantization/minimax_m3_w4a16.py --input-path ... --output-path ... --max-workers 4` → 225GB W4A16 moe-only 产物
+2. **打 sglang 补丁**: 补丁 1-6 (海光兼容) + 补丁 7 (W4A16 KeyError Linear)
+3. **启动**: `bash quantization/minimax_w4a16.sh` → sglang serve on :8081
 
 详见 `docs/MiniMax-M3-量化工作记录.md`。
 
 ## 状态
 
-- ✅ BW100 (gfx936): 量化 + sglang 适配 + forward 跑通, chat/completions 返回连贯中文
+- ✅ W8A8 moe-only: BW100 (gfx936) 量化 + sglang 适配 + forward 跑通, chat/completions 返回连贯中文
+- ✅ W4A16 moe-only: BW100 (gfx936) 量化 (225G) + sglang 加载成功 (`CompressedTensorsWNA16TritonMoE` ROCm 路径), forward/精度待测
 - ⏳ gfx928 (K100): 待实测 (lightop 无 gfx928 产物, 用 tilelang/Triton 路径)
