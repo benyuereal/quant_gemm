@@ -1,0 +1,24 @@
+--- /models/sglang_backup/int8_kernel.py	2026-07-22 10:30:40.159266671 +0800
++++ /usr/local/lib/python3.10/dist-packages/sglang/srt/layers/quantization/int8_kernel.py	2026-07-22 10:40:02.046253875 +0800
+@@ -8,9 +8,10 @@
+ import triton
+ import triton.language as tl
+ 
+-from sglang.srt.utils import get_device_name, is_cuda
++from sglang.srt.utils import get_device_name, is_cuda, is_hip
+ 
+ _is_cuda = is_cuda()
++_is_hip = is_hip()
+ if _is_cuda:
+     # Temporary
+     try:
+@@ -47,7 +48,8 @@
+     absmax = tl.maximum(tl.max(tl.abs(x)), 1e-10)
+     scale_x = absmax / 127
+     x_q = x * (127 / absmax)
+-    x_q = tl.extra.cuda.libdevice.round(x_q).to(tl.int8)
++    # 海光 HIP 镜像专用: tl.extra.cuda.libdevice 不可用, 直接用 tl.extra.hip.libdevice
++    x_q = tl.extra.hip.libdevice.round(x_q).to(tl.int8)
+     if CAL_SUM:
+         x_sum = tl.sum(x, axis=0)
+         tl.store(x_sum_ptr + row_id, x_sum.to(x_sum_ptr.dtype.element_ty))

@@ -1,0 +1,18 @@
+--- /models/sglang_backup/schemes___init__.py	2026-07-22 09:43:20.543168405 +0800
++++ /usr/local/lib/python3.10/dist-packages/sglang/srt/layers/quantization/compressed_tensors/schemes/__init__.py	2026-07-22 09:48:56.900593696 +0800
+@@ -15,6 +15,7 @@
+     NPUCompressedTensorsW8A8Int8,
+ )
+ from .compressed_tensors_w8a8_int8_moe import NPUCompressedTensorsW8A8Int8DynamicMoE
++from .compressed_tensors_w8a8_int8_triton_moe import CompressedTensorsW8A8Int8TritonMoE
+ from .compressed_tensors_w8a16_fp8 import CompressedTensorsW8A16Fp8
+ from .compressed_tensors_wNa16 import WNA16_SUPPORTED_BITS, CompressedTensorsWNA16
+ from .compressed_tensors_wNa16_moe import (
+@@ -32,6 +33,7 @@
+     "CompressedTensorsW8A8Int8",
+     "NPUCompressedTensorsW8A8Int8",
+     "NPUCompressedTensorsW8A8Int8DynamicMoE",
++    "CompressedTensorsW8A8Int8TritonMoE",
+     "CompressedTensorsWNA16",
+     "CompressedTensorsWNA16MoE",
+     "CompressedTensorsWNA16TritonMoE",

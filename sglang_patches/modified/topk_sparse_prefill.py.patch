@@ -1,0 +1,12 @@
+--- /models/sglang_backup/topk_sparse_prefill.py	2026-07-22 11:04:45.922992616 +0800
++++ /usr/local/lib/python3.10/dist-packages/sglang/srt/layers/attention/minimax_sparse_ops/prefill/topk_sparse.py	2026-07-22 11:04:59.224613513 +0800
+@@ -27,9 +27,7 @@
+ @triton.autotune(
+     configs=[
+         triton.Config({}, num_warps=4, num_stages=2),
+-        triton.Config({}, num_warps=4, num_stages=3),
+         triton.Config({}, num_warps=8, num_stages=2),
+-        triton.Config({}, num_warps=8, num_stages=3),
+     ],
+     key=[
+         "BLOCK_SIZE_Q",

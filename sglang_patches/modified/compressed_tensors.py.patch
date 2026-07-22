@@ -1,0 +1,43 @@
+--- /models/sglang_backup/compressed_tensors.py	2026-07-22 09:43:20.541168462 +0800
++++ /usr/local/lib/python3.10/dist-packages/sglang/srt/layers/quantization/compressed_tensors/compressed_tensors.py	2026-07-22 10:51:22.034895952 +0800
+@@ -51,6 +51,7 @@
+     CompressedTensorsWNA16,
+     CompressedTensorsWNA16MoE,
+     CompressedTensorsWNA16TritonMoE,
++    CompressedTensorsW8A8Int8TritonMoE,
+     NPUCompressedTensorsW4A8Int8DynamicMoE,
+     NPUCompressedTensorsW4A16Int4DynamicMoE,
+     NPUCompressedTensorsW8A8Int8,
+@@ -710,9 +711,12 @@
+             if _is_npu:
+                 logger.info_once("Using NPUCompressedTensorsW8A8Int8DynamicMoE")
+                 return NPUCompressedTensorsW8A8Int8DynamicMoE(weight_quant, input_quant)
++            elif _is_hip:
++                logger.info_once("Using CompressedTensorsW8A8Int8TritonMoE (ROCm/HIP)")
++                return CompressedTensorsW8A8Int8TritonMoE(self)
+             else:
+                 raise NotImplementedError(
+-                    f"The W8A8Int8 Fused MoE scheme is implemented only for NPU for now."
++                    f"The W8A8Int8 Fused MoE scheme is implemented only for NPU/HIP for now."
+                 )
+         elif self._is_dynamic_token_w4a8(weight_quant, input_quant):
+             if _is_npu:
+@@ -757,6 +761,18 @@
+             weight_quant = scheme_dict.get("weights")
+             input_quant = scheme_dict.get("input_activations")
+ 
++        # 海光 moe-only 方案: Linear W8A8 底层 int8_scaled_mm 不可用, 且我们只量化
++        # MoE expert. 海光下把 Linear W8A8 dynamic-token 当成不量化 (走 bf16).
++        # MoE expert 量化由 get_moe_scheme -> CompressedTensorsW8A8Int8TritonMoE 处理.
++        if (
++            _is_hip
++            and weight_quant is not None
++            and input_quant is not None
++            and self._is_dynamic_token_w8a8(weight_quant, input_quant)
++        ):
++            weight_quant = None
++            input_quant = None
++
+         # Find the sparsity scheme of the layer
+         # assume that fused layers inerhit first component's sparsity scheme
+         sparsity_targets = self.sparsity_scheme_map.keys() - set(
