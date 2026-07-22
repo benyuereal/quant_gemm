@@ -107,6 +107,55 @@ def weight_quantint4_search_k(
 
 
 # ============================================================
+# W4A16 per-group (g=128) 量化 + pack_quantized 格式
+# ============================================================
+# sglang CompressedTensorsWNA16TritonMoE 期望的 pack_quantized 布局:
+#   权重: [N, K//8] int32  (8 个 int4 沿 K 维 pack 进一个 int32, 小端: group内低位在前)
+#   scale: [N, K//group_size] f32  (per-group, 沿 K 维分 group)
+#   config: format=pack_quantized, weights num_bits=4 strategy=group group_size=128
+#           input_activations=null (W4A16 激活不量化), symmetric=true, dynamic=false
+# 对称量化 qmax=7, 每 group 独立算 absmax/scale.
+
+W4A16_GROUP_SIZE = 128
+W4A16_PACK_FACTOR = 8  # 32 bits / 4 bits = 8 个 int4 进一个 int32
+
+
+def weight_quant_int4_group_pack(tensor: torch.Tensor, group_size: int = W4A16_GROUP_SIZE):
+    """per-group 对称 INT4 量化 + pack 8×int4→int32.
+
+    输入: tensor [N, K] (bf16/fp32)
+    输出:
+      q_packed [N, K//8] int32  (K 维 pack, 小端序: 第 i 个 int4 在 bits [4i:4i+4])
+      scale    [N, K//group_size] f32  (per-group)
+      dequant  [N, K] fp32  (反量化参考, 用于精度验证)
+    要求 K % group_size == 0 且 K % 8 == 0 (group_size=128 满足).
+    """
+    assert tensor.dim() == 2, f"expect 2D [N,K], got {tensor.shape}"
+    N, K = tensor.shape
+    assert K % group_size == 0, f"K={K} 必须被 group_size={group_size} 整除"
+    assert group_size % 8 == 0, "group_size 必须被 8 整除 (pack 对齐)"
+    n_groups = K // group_size
+
+    # per-group 对称 int4 量化
+    w = tensor.float()
+    w_g = w.view(N, n_groups, group_size)  # [N, n_groups, group_size]
+    absmax = w_g.abs().amax(dim=-1).clamp(min=1e-8)  # [N, n_groups]
+    scale = (absmax / 7.0).to(torch.float32)  # [N, n_groups]
+    q = torch.round(w_g / scale.unsqueeze(-1)).clamp(-8, 7).to(torch.int8)  # [N, n_groups, group_size]
+    q = q.view(N, K)  # [N, K] int8, 范围 [-8,7]
+
+    deq = (q.view(N, n_groups, group_size).float() * scale.unsqueeze(-1)).view(N, K)
+
+    # pack 8×int4 → int32, 沿 K 维. 小端序: q[..., 0] 在最低 4 bit, q[..., 7] 在最高 4 bit
+    q_u4 = (q.to(torch.int32) & 0x0F)  # [N, K] int32, 低 4 bit
+    q_u4 = q_u4.view(N, K // 8, 8)  # [N, K//8, 8]
+    shifts = torch.tensor([0, 4, 8, 12, 16, 20, 24, 28], device=tensor.device, dtype=torch.int32)
+    q_packed = (q_u4 << shifts).sum(dim=-1).to(torch.int32)  # [N, K//8] int32
+
+    return q_packed.contiguous(), scale.contiguous(), deq
+
+
+# ============================================================
 # MiniMax-M3 专用忽略列表
 # ============================================================
 
@@ -204,6 +253,17 @@ def worker(
 
             if quant_type == "fp8":
                 q, s = weight_quant_fp8(weight)
+            elif quant_type == "w4a16":
+                # W4A16 per-group (g=128) int4 + pack_quantized.
+                # 只对 MoE expert 做 (moe-only); 非 MoE 在前面 moe_only 分支已跳过.
+                # q_packed [N, K//8] int32, scale [N, K//128] f32
+                try:
+                    q, s, _ = weight_quant_int4_group_pack(weight)
+                except Exception as e:
+                    print(f"[WARN] w4a16 quant failed for {weight_name}: {e}, keep bf16")
+                    new_state_dict[weight_name] = weight
+                    shared_weight_map[weight_name] = file_name
+                    continue
             else:
                 # 第一步: 所有层 INT8 量化
                 try:
@@ -223,9 +283,15 @@ def worker(
             # 恢复 3D 形状
             if original_shape is not None:
                 E, N, K_orig = original_shape
-                K_out = q.shape[-1]
-                q = q.reshape(E, N, K_out)
-                s = s.reshape(E, N, 1)
+                if quant_type == "w4a16":
+                    # W4A16: q [E*N, K//8] -> [E, N, K//8] -> 转置成 sglang 期望 [E, K//8, N]
+                    # scale [E*N, K//128] -> [E, N, K//128] -> 转置 [E, K//128, N]
+                    q = q.reshape(E, N, -1).transpose(1, 2).contiguous()  # [E, K//8, N]
+                    s = s.reshape(E, N, -1).transpose(1, 2).contiguous()  # [E, K//128, N]
+                else:
+                    K_out = q.shape[-1]
+                    q = q.reshape(E, N, K_out)
+                    s = s.reshape(E, N, 1)
 
             new_state_dict[weight_name] = q
             new_scale_name = f"{weight_name}_scale"
@@ -241,7 +307,7 @@ def worker(
 # ============================================================
 
 def main(input_path: str, output_path: str, quant_type: str = "int4", moe_only: bool = False):
-    assert quant_type in ("int4", "int8", "fp8"), f"Unsupported quant_type: {quant_type}"
+    assert quant_type in ("int4", "int8", "fp8", "w4a16"), f"Unsupported quant_type: {quant_type}"
 
     src_dir = Path(input_path)
     dst_dir = Path(output_path)
@@ -304,6 +370,35 @@ def main(input_path: str, output_path: str, quant_type: str = "int4", moe_only: 
     effective_ignore = list(IGNORE_LAYERS)
     if moe_only:
         effective_ignore += MOE_ONLY_EXTRA_IGNORE
+
+    if quant_type == "w4a16":
+        # W4A16 pack_quantized: per-group int4 weight + bf16 激活 (input_activations=null)
+        # sglang CompressedTensorsWNA16TritonMoE 要求 format=pack_quantized + strategy=group
+        config["quantization_config"] = {
+            "quant_method": "compressed-tensors",
+            "format": "pack_quantized",
+            "quantization_status": "compressed",
+            "version": "0.17.1",
+            "config_groups": {
+                "group_0": {
+                    "weights": {
+                        "num_bits": 4,
+                        "type": "int",
+                        "strategy": "group",
+                        "group_size": W4A16_GROUP_SIZE,
+                        "symmetric": True,
+                        "dynamic": False,
+                        "observer": "minmax",
+                        "observer_kwargs": {},
+                    },
+                    "input_activations": None,  # W4A16: 激活不量化
+                    "targets": ["Linear"],
+                }
+            },
+            "ignore": effective_ignore,
+            "kv_cache_scheme": None,
+            "sparsity_config": {},
+        }
 
     if quant_type == "int4":
         config["quantization_config"] = {
@@ -406,7 +501,7 @@ if __name__ == "__main__":
     parser.add_argument("--output-path", type=str, required=True,
                         help="Output directory for quantized model")
     parser.add_argument("--quant-type", type=str, default="int4",
-                        choices=["int4", "int8", "fp8"],
+                        choices=["int4", "int8", "fp8", "w4a16"],
                         help="Quantization type")
     parser.add_argument("--moe-only", action="store_true",
                         help="Only quantize MoE experts (block_sparse_moe.experts.*.w1/w2/w3); "
