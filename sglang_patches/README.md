@@ -1,12 +1,14 @@
-# sglang 补丁 — 海光 DCU W8A8 / W4A16 MoE 适配
+# sglang 补丁 — 海光 DCU W8A8 / W4A16 MoE 适配 + EAGLE3 投机解码
 
 本目录是对 sglang (dev 0.0.0.dev12695) 的补丁, 使其能在海光 DCU (gfx936/gfx928)
-上加载并推理 **W8A8 与 W4A16 量化 (只量化 MoE expert) 的 MiniMax-M3**.
+上加载并推理 **W8A8 与 W4A16 量化 (只量化 MoE expert) 的 MiniMax-M3**, 并支持
+**EAGLE3 投机解码** (搭配 `Inferact/MiniMax-M3-EAGLE3` draft head).
 
 **状态:**
 - **W8A8 moe-only**: BW100 (gfx936) 上 forward 已跑通, chat/completions 请求成功, 输出连贯.
 - **W4A16 moe-only**: BW100 (gfx936) 上 sglang 加载成功 (`The server is fired up and ready to roll!`),
   走 `CompressedTensorsWNA16TritonMoE (ROCm)` 纯 Triton 路径. 补丁 1-6 为 W8A8, 补丁 7 为 W4A16.
+- **EAGLE3**: 补丁 8 给 M3 VL 类补 EAGLE3 target 侧接口 (上游缺失, 见 docs/MiniMax-M3-EAGLE3-工作记录.md).
 
 ## 改动总览
 
@@ -19,9 +21,14 @@
 | `modified/topk_sparse_prefill.py` | 改动 | sparse attn **prefill** kernel `num_stages=1` (BW100 共享内存 64K, stages≥2 超 65536) |
 | `modified/topk_sparse_decode.py` | 改动 | sparse attn **decode** kernel `num_stages=1` (同上, decode 阶段也超) |
 | `modified/compressed_tensors_wNa16_moe.py` | 改动 | **W4A16**: `CompressedTensorsWNA16MoE.__init__` 兼容正则层名 target, 不再硬编码 `target_scheme_map["Linear"]` (否则 `KeyError: 'Linear'`) |
+| `modified/minimax_m3_vl.py` | 改动 | **EAGLE3**: M3 VL 类 (`MiniMaxM3SparseForConditionalGeneration`) 补 `set_eagle3_layers_to_capture` (含 `setattr layer._is_layer_to_capture=True` 修复 aux 捕获链路) / `get_embed_and_head` / aux-aware forward. 原 VL 类无这些接口 (只在 text-only 类上), 量化产物加载 VL 类故 EAGLE3 启动即 AttributeError. 原文件备份 `sglang_backup/minimax_m3_vl.py`. |
+| `modified/minimax_sparse_backend.py` | 改动 | **EAGLE3**: `init_forward_metadata` 兜底 EAGLE3 TARGET_VERIFY. TARGET_VERIFY 的 `is_extend()==True` (走 forward_extend) 但 `ForwardBatch.init_new` 把它归 decode 分支不填 extend 字段, sparse backend 取 `max(None)`/`.device` 崩. 兜底: `extend_seq_lens` 为 None 时用 `spec_info.draft_token_num` 一次性补全 `extend_seq_lens`/`extend_seq_lens_cpu`/`extend_prefix_lens`/`extend_prefix_lens_cpu`, 再算 `_max_seqlen_q`. 原文件备份 `sglang_backup/minimax_sparse_backend.py`. |
 
-每个 `modified/*.py.patch` 是相对原始 sglang 的 diff, 可用 `patch -p1 < xxx.patch` 应用.
-`modified/*.py` 是改后的完整文件, 可直接覆盖.
+每个 `modified/*.py.patch` 是相对原始 sglang 的 diff, 可用 `patch -p1 < xxx.patch` 应用
+(单文件回溯可用 `patch -p4 < xxx.py.patch`). `modified/*.py` 是改后的完整文件, 可直接覆盖.
+
+> 注: EAGLE3 补丁已直接应用进 site-packages (子进程需继承, monkey-patch 仅主进程生效不够).
+> 回滚: `cp /models/sglang_backup/minimax_m3_vl.py /usr/local/lib/python3.10/dist-packages/sglang/srt/models/minimax_m3_vl.py`.
 
 ## 各改动详解
 
