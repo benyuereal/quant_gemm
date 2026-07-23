@@ -127,19 +127,18 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
 
             self._max_seqlen_q = int(max(forward_batch.extend_seq_lens_cpu))
             # K length = prefix + draft. For verify, seq_lens is the prefix and
-            # extend_seq_lens is the draft; for normal extend, seq_lens is
-            # already prefix+extend (so adding extend_seq_lens again would be
-            # wrong). Detect verify by checking whether seq_lens already
-            # includes the extend (seq_lens >= prefix_lens + extend_seq_lens).
-            prefix_plus_extend = (
-                forward_batch.extend_prefix_lens + forward_batch.extend_seq_lens
-            )
-            if torch.all(forward_batch.seq_lens >= prefix_plus_extend):
+            # K length = prefix + draft. For verify, seq_lens is the prefix
+            # (scheduler adds accept_lens after); for normal extend, seq_lens
+            # is already prefix+extend. Use forward_mode (clear) instead of a
+            # torch.all() comparison.
+            if forward_batch.forward_mode.is_target_verify():
+                prefix_plus_extend = (
+                    forward_batch.extend_prefix_lens + forward_batch.extend_seq_lens
+                )
+                self._max_seqlen_k = int(prefix_plus_extend.max().item())
+            else:
                 # Normal extend: seq_lens already = prefix + extend.
                 self._max_seqlen_k = int(forward_batch.seq_lens.max().item())
-            else:
-                # Verify: seq_lens is just the prefix; rebuild prefix + draft.
-                self._max_seqlen_k = int(prefix_plus_extend.max().item())
         else:
             # seq_lens_cpu is a CPU tensor – .max().item() is fine here
             self._max_seqlen_q = 1
@@ -158,8 +157,18 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         forward_mode,
         spec_info,
     ):
-        self._max_seqlen_q = 1
-        self._max_seqlen_k = int(seq_lens[:bs].max().item())
+        # EAGLE3 TARGET_VERIFY: q length = draft_token_num (not 1, which is the
+        # decode value), K length = prefix + draft (seq_lens here is the prefix,
+        # the scheduler adds accept_lens after). Same semantics as the eager
+        # init_forward_metadata path. Without this, sparse prefill computes wrong
+        # block counts and output garbles under cuda graph.
+        draft_token_num = getattr(spec_info, "draft_token_num", None)
+        if forward_mode.is_target_verify() and draft_token_num is not None:
+            self._max_seqlen_q = int(draft_token_num)
+            self._max_seqlen_k = int(seq_lens[:bs].max().item()) + int(draft_token_num)
+        else:
+            self._max_seqlen_q = 1
+            self._max_seqlen_k = int(seq_lens[:bs].max().item())
 
     def init_forward_metadata_replay_cuda_graph(
         self,
@@ -173,8 +182,14 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         seq_lens_cpu,
     ):
         # seq_lens_cpu is a CPU tensor – safe to call .max().item() here.
-        self._max_seqlen_q = 1
-        self._max_seqlen_k = int(seq_lens_cpu[:bs].max().item())
+        # Same TARGET_VERIFY fix as capture path above.
+        draft_token_num = getattr(spec_info, "draft_token_num", None)
+        if forward_mode.is_target_verify() and draft_token_num is not None:
+            self._max_seqlen_q = int(draft_token_num)
+            self._max_seqlen_k = int(seq_lens_cpu[:bs].max().item()) + int(draft_token_num)
+        else:
+            self._max_seqlen_q = 1
+            self._max_seqlen_k = int(seq_lens_cpu[:bs].max().item())
 
     def get_cuda_graph_seq_len_fill_value(self):
         return 1
@@ -219,6 +234,44 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         idx_v: Optional[torch.Tensor],
     ):
         disable_value = layer.layer_id in self.disable_value_layer_ids
+
+        # EAGLE3 TARGET_VERIFY: extend_seq_lens may be None here.
+        # - eager: init_forward_metadata already materialised it.
+        # - cuda graph capture/replay: init_forward_metadata_capture_cuda_graph
+        #   does NOT set it (the captured ForwardBatch leaves it None), so the
+        #   cu_seqlens build below would crash on `.device`. Materialise it here
+        #   from spec_info.draft_token_num with a fixed shape (graph-safe: no
+        #   host sync, no dynamic shape). Uniform draft_token_num per request.
+        if forward_batch.extend_seq_lens is None:
+            spec_info = getattr(forward_batch, "spec_info", None)
+            draft_token_num = getattr(spec_info, "draft_token_num", None)
+            num_reqs = forward_batch.seq_lens.shape[0]
+            if draft_token_num is None:
+                draft_token_num = (
+                    forward_batch.input_ids.shape[0] // max(num_reqs, 1)
+                )
+            forward_batch.extend_seq_lens = torch.full(
+                (num_reqs,), int(draft_token_num),
+                dtype=torch.int32, device=forward_batch.seq_lens.device,
+            )
+            # _cpu list fields use no host sync to build, but only set them
+            # outside graph capture (forward_extend only needs the tensors;
+            # the _cpu lists are consumed by init_forward_metadata in eager).
+            if not torch.cuda.is_current_stream_capturing():
+                if forward_batch.extend_seq_lens_cpu is None:
+                    forward_batch.extend_seq_lens_cpu = [int(draft_token_num)] * num_reqs
+                if forward_batch.extend_prefix_lens is None:
+                    # verify: seq_lens is the prefix (scheduler adds accept_lens later)
+                    forward_batch.extend_prefix_lens = forward_batch.seq_lens.to(torch.int32)
+                    forward_batch.extend_prefix_lens_cpu = (
+                        forward_batch.extend_prefix_lens.cpu().tolist()
+                    )
+            else:
+                # Under graph capture: only materialise the tensors (graph-safe,
+                # fixed shape). _cpu lists are not needed in the captured path.
+                if forward_batch.extend_prefix_lens is None:
+                    forward_batch.extend_prefix_lens = forward_batch.seq_lens.to(torch.int32)
+
         self.kv_pool.set_kv_buffer(
             layer,
             forward_batch.out_cache_loc,
@@ -261,20 +314,33 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         # (the scheduler adds accept_lens after verify), so rebuild it as
         # prefix + extend here.
         raw_seq_lens = forward_batch.seq_lens.to(torch.int32)
-        if forward_batch.extend_prefix_lens is not None:
+        if forward_batch.forward_mode.is_target_verify():
+            # EAGLE3 verify: seq_lens is the PREFIX (scheduler adds accept_lens
+            # after). Use raw_seq_lens directly as prefix_lens — it is a buffer
+            # reference that holds the REAL per-request prefix at replay time.
+            # Do NOT use forward_batch.extend_prefix_lens: under cuda graph it
+            # was materialised once at capture time with a fixed value and is
+            # not updated on replay, so it would be stale and garble output.
+            prefix_lens = raw_seq_lens
+            seq_lens = raw_seq_lens + forward_batch.extend_seq_lens.to(torch.int32)
+        elif forward_batch.extend_prefix_lens is not None:
             prefix_lens = forward_batch.extend_prefix_lens.to(torch.int32)
-        else:
-            prefix_lens = torch.zeros_like(raw_seq_lens)
-        prefix_plus_extend = prefix_lens + forward_batch.extend_seq_lens.to(torch.int32)
-        if torch.all(raw_seq_lens >= prefix_plus_extend):
             seq_lens = raw_seq_lens  # normal extend: already prefix + extend
         else:
-            seq_lens = prefix_plus_extend  # verify: rebuild prefix + draft
+            prefix_lens = torch.zeros_like(raw_seq_lens)
+            seq_lens = raw_seq_lens
 
         # In DP attention mode, q may be padded beyond the actual token count
         # for collective communication alignment. Trim to actual tokens so
         # the sparse attention kernel sees consistent shapes.
-        actual_num_tokens = int(cu_seqlens[-1].item())
+        # NOTE: .item() is a host sync and is illegal inside CUDA graph capture.
+        # Under capture (EAGLE3 TARGET_VERIFY graph), shapes are fixed and
+        # non-DP, so cu_seqlens[-1] == q.shape[0] == num_tokens; use the static
+        # q.shape[0] instead of .item(). .item() is only safe in eager mode.
+        if torch.cuda.is_current_stream_capturing():
+            actual_num_tokens = q.shape[0]
+        else:
+            actual_num_tokens = int(cu_seqlens[-1].item())
         original_num_tokens = q.shape[0]
         if actual_num_tokens < original_num_tokens:
             q = q[:actual_num_tokens]

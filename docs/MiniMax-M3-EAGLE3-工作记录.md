@@ -148,6 +148,34 @@ layer 上的 `_is_layer_to_capture=True`**。
 - 实际接受率 (预期因 MXFP8 vs W4A16 精度差异偏低)
 - 实际加速比 (W4A16 瓶颈是 MoE int4 GEMM, spec decode 可能加速比打折 — 见 `minimax-m3-perf-bottleneck`)
 
+### 5.6 cuda graph 适配 (最终性能突破)
+
+eager 模式 (disable-cuda-graph) 下 1.5x (5→7.5 tok/s), accept~0.4. 开 cuda graph 后需修一连串 graph-unsafe 的 host 同步, 最终 4x (5→21 tok/s), accept~0.78.
+
+**根因**: sglang 的 M3 sparse attention **decode kernel 专为 cuda graph 设计** (grid 不依赖 seq_len, 注释 "grid independent of seq_len for cuda graph"), 但 **prefill kernel 不是** — EAGLE3 verify 走 forward_extend → sparse prefill, 撞上 prefill 的 host 同步. 纯 W4A16 (无 EAGLE3) 捕获 DECODE mode 走 decode kernel, 所以能 graph; EAGLE3 捕获 TARGET_VERIFY mode 走 prefill, 所以崩.
+
+**修的 host 同步 (全部 `is_current_stream_capturing()` 判断或静态计算)**:
+1. `forward_extend` 的 `extend_seq_lens.device` None → capture 路径 `init_forward_metadata_capture_cuda_graph` 不补 extend 字段, 在 forward_extend 开头兜底 (graph-safe: `torch.full` 固定 shape).
+2. `forward_extend` 的 `torch.all(raw_seq_lens >= prefix_plus_extend)` → host 同步, 改用 `forward_mode.is_target_verify()` 静态判断.
+3. `forward_extend` 的 `extend_prefix_lens.cpu().tolist()` → capture 时跳过 _cpu 字段.
+4. `forward_extend` 的 `cu_seqlens[-1].item()` → capture 时用静态 `q.shape[0]`.
+5. `get_cu_seqblocks` (utils.py) 的 `seqblocks_q.sum().item()` ×2 → capture 时用静态上界 `batch_size * max_seqblock` (graph-safe, 不读 tensor 值).
+
+**修的字段语义 (graph 路径漏了 eager 路径的坑 D 修复)**:
+6. `init_forward_metadata_capture_cuda_graph` / `replay` 的 `_max_seqlen_q=1, _max_seqlen_k=max(seq_lens)` 是 decode 语义 → verify 下应为 `_max_seqlen_q=draft_token_num, _max_seqlen_k=max(seq_lens)+draft_token_num` (seq_lens 是 prefix).
+7. `forward_extend` 的 `prefix_lens = forward_batch.extend_prefix_lens` → graph 下是 capture 时的固定 tensor (stale), 改用 `raw_seq_lens` (= `forward_batch.seq_lens`, buffer 引用, replay 时是真实 prefix).
+
+**改动文件**: `minimax_sparse_backend.py` (1-7 全部) + `utils.py` (5). 备份 `sglang_backup/`, patch 在 `sglang_patches/modified/`.
+
+**最终性能** (W4A16 moe-only target + Inferact BF16 draft, TP=4, B=1, temp=0.7, cuda-graph-max-bs=8):
+- 纯 W4A16 eager: 5 tok/s
+- 纯 W4A16 cuda graph: 13 tok/s
+- EAGLE3 eager: 7.5 tok/s (accept~0.4)
+- **EAGLE3 cuda graph: 16-22 tok/s (峰值 21.7), accept 0.58-0.87 (平均 ~0.78), accept len 3.4**
+- = 4x over eager, 1.7x over 纯 graph, accept 接近 README 的 0.84
+
+> accept 从 eager 的 0.4 涨到 graph 的 0.78, 可能因 eager 下 attention 不稳定; graph 路径更稳定反而拉高 accept. 输出经 chat.py 验证正常 (不乱码不复读, 思考+代码连贯).
+
 ### 5.7 实测踩坑 (启动后)
 
 跑通 patch 后, 启动又依次撞到两个 sglang 上游与 EAGLE3 的兼容 bug, 均已修 (直接改 site-packages + 备份):
