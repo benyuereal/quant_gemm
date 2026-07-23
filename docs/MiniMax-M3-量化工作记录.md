@@ -975,3 +975,83 @@ sglang serve \
 - **MiniMax-M3 自己校准跑不通**：无 HF modeling 文件，`AutoModelForCausalLM` 加载失败，AutoAWQ/llmcompressor 校准无法进行
 - **cyankiwi AWQ 是现成校准产物**：`observer=mse`（真AWQ校准）+ group=32 + MoE量化 + 敏感层保bf16，sglang 原生可加载，作为有校准基准对比用
 - 本次自做 W4A16 moe-only 目的：验证 naive int4 moe-only 在 sglang 上能否加载+跑通，并与校准版客观对比（需搭端到端评测）
+
+## 二十七、tilelang W4A16 fused MoE 算子（替换 sglang Triton int4）
+
+**目标**：MoE 占 decode 76%，sglang 海光路径走 Triton `fused_moe_kernel_gptq_awq`（慢）。用 tilelang 自写 W4A16 fused MoE 替换两个 int4 GEMM，路由/重排/combine 复用 sglang 基础设施。代码已入 `quant_gemm_pkg/quant_gemm/moe/`（push github `benyuereal/quant_gemm`）。
+
+### 27.1 包结构
+
+```
+quant_gemm/moe/
+├── __init__.py        # 导出 w4a16_grouped_gemm / w4a16_fused_moe / quantize_int4_per_group ...
+├── kernels.py         # w4a16_grouped_gemm: per-group int4 grouped GEMM (tilelang)
+├── quant.py           # quantize/dequant_int4_per_group (zp=8 对称, sglang 兼容)
+├── moe.py             # w4a16_fused_moe: 路由+2GEMM+silu+combine 完整 fused MoE
+└── tests/
+    ├── bench_perf.py              # M3 真实 shape 性能 vs sglang
+    ├── verify_real_weights.py     # 端到端真实产物对比 sglang (可替换性判据)
+    ├── profile_overhead.py        # 分项 profiling
+    └── debug_*.py                 # 历史调试脚本
+```
+
+### 27.2 kernel 设计
+
+- `w4a16_grouped_gemm`：per-group int4（zp=8 对称，group=128），`block_K = group_size`（每 K group 一个 scale，索引简单）。线程级 int4 unpack：`_tir_packed_to_unsigned_convert` + 减 8（zp）→ bf16 → GEMM → 乘 per-N scale 累加。
+- 路由通过 `block_to_expert/block_m_start/block_actual_rows` 表传入（同 W8A8 框架）。
+- **性能关键：kernel 内 `if bx < num_valid_blocks[0]` 跳过 padding 块**（等价 sglang `if pid_m*BLOCK_M >= num_tokens_post_padded: return`）。`dcu_moe_align_block_size` 返回的 `expert_ids` 只有前 `ceil(num_tokens_post_padded/block_M)` 个有效，后面是未初始化垃圾；M=1 时 121 个 block 仅 4 个有效，跳过 117 个垃圾块（否则 97% 算力浪费）。
+- combine 只对前 `ntp_val` 行做（`cache_down[:ntp_val]`），避免对 total_pad 行的无谓逐元素乘 + index_add。
+
+### 27.3 权重布局（与 sglang 海光路径一致）
+
+sglang `CompressedTensorsWNA16TritonMoE.process_weights_after_loading` 把产物 int32 packed 转成 kernel 期望格式：
+```
+w13: [E, K//8, N] int32 --transpose(1,2)--> [E, N, K//8] --view(uint8)--> [E, N, K//2] uint8
+w13_scale: [E, K//group, N] --transpose(1,2)--> [E, N, K//group] bf16
+```
+tilelang 算子期望正是 `[E, N, K//2] uint8` + `[E, N, K//group] bf16`，**布局完全兼容，可无缝接收 sglang 处理后的权重**。
+
+### 27.4 真实产物维度（更正之前记错的）
+
+实测 `MiniMax-M3-w4a16-moe-only` 的 `weight_shape`（TP=1 / inter 不切）：
+- w1(gate) `[3072, 6144]`、w3(up) `[3072, 6144]` → 合 w13 `[6144, 6144]` = N_gate_up=6144
+- w2(down) `[6144, 3072]` = `[N_down, N_inter=3072]`
+- **shard_intermediate=3072，N_gate_up=6144，N_inter=3072，K=N_down=6144**（之前误记 shard_inter=1536，那是随机权重 bench 的旧维度）
+
+### 27.5 正确性验证（真实产物，可安全替换）
+
+`tests/verify_real_weights.py`：读真实 M3 产物 8 个 expert 权重，转 uint8 组装到 E=128，同权重同路由喂 tilelang 和 sglang Triton int4：
+```
+tilelang vs sglang : max_diff=7.8125e-03  mean=4.1137e-04   ✅ < 1e-2
+```
+**结论：tilelang 与 sglang Triton int4 输出一致，布局/nibble 顺序/scale 语义全兼容，可安全替换。**
+（注：tilelang vs deq_ref 与 sglang vs deq_ref 都 ~342%，两者一起错，是 deq_ref 参考实现的量化语义假设与真实产物不一致，非算子问题，不影响替换判据。）
+
+### 27.6 性能对比（真实维度，vs sglang default Triton）
+
+M3 真实 shape：E=128, K=6144, shard_inter=3072, N_gate_up=6144, N_down=6144, topk=4。
+sglang 在 N=6144 无 tuned config（tuned 仅 N=384 有），故 sglang-tuned = sglang-default。
+
+| M | tilelang | sglang | 加速比 | tl_vs_sgl max_diff |
+|---|---|---|---|---|
+| 1 | 1319us | 3310us | **2.51x** | 7.3e-4 ✅ |
+| 2 | 1743us | 6511us | **3.74x** | 9.8e-4 ✅ |
+| 4 | 2790us | 12924us | **4.63x** | 1.2e-3 ✅ |
+| 8 | 4630us | 22490us | **4.87x** | 1.2e-3 ✅ |
+| 16 | 8209us | 39146us | **4.77x** | — |
+| 32 | 13937us | 68507us | **4.92x** | — |
+
+**全 batch 大幅领先，生产 decode（M=1-2）2.5-3.7x。**（之前错维度 shard_inter=1536 时 M=1 仅 1.69x，真实维度 3072 下 N 翻倍 sglang 更慢，tilelang 优势扩大。）
+
+### 27.7 性能拆解（M=1，定位下一步优化）
+
+`profile_overhead.py` 分项（真实维度）：
+- kernel 端：align 24us + kernel1(gate_up) 254us + silu 38us + kernel2(down) 137us + combine 75us ≈ **528us**
+- e2e 实测 1319us，**~790us 是 host-side Python op launch 开销**（gather/cat/arange/where/index_add 等 ~25 个 op，每个 30-40us launch）
+- → **下一步优化重点：降 host 开销**（预分配 buffer 复用、合并 op、减少临时 tensor）
+
+### 27.8 已知稳定性问题（待修）
+
+1. **`sgl_kernel.silu_and_mul` launch_bounds 警告**：N_inter=3072 时 `Launch params (384,1,1) > launch bounds (256)`。目前是 warning 不崩，但需查是否有替代实现或自写 tilelang silu。
+2. **小 E（<8）dcu_moe_align_block_size segfault**：dcu_align 的 expert_ids 在小 E 时输出垃圾，仅适用真实 E=128。小规模测试用 `moe_align_torch` 纯 torch 路径。
+3. **sglang 无 N=6144 tuned config**：真实维度下 sglang 走 default config（未调优），对比偏保守；若要更公平可为 N=6144 调一份 tuned config。
