@@ -1,0 +1,40 @@
+--- /usr/local/lib/python3.10/dist-packages/sglang/srt/layers/moe/moe_runner/triton.py	2026-06-05 16:34:46.000000000 +0800
++++ sglang_patches/modified/triton.py	2026-07-23 11:12:44.482449471 +0800
+@@ -90,6 +90,37 @@
+             or self.config.num_experts != self.config.num_local_experts
+         )
+ 
++        # [Hygon DCU W4A16 tilelang 替换] int4_w4a16 且显式开启时, 走 tilelang 自写
++        # W4A16 fused MoE (gfx936/gfx928, 替换慢的 Triton fused_moe_kernel_gptq_awq).
++        # 复用 runner_input 已对齐的 sorted_token_ids/expert_ids/num_tokens_post_padded,
++        # 不重复 align. 正确性: vs sglang Triton int4 max_diff<1e-3 (verify_replacement.py).
++        # 性能: M=1 2.51x ~ M=32 4.92x (真实维度). 环境变量控制, 默认关, 可随时回退.
++        import os
++        _use_tilelang_w4a16 = (
++            quant_info.use_int4_w4a16
++            and os.environ.get("SGLANG_USE_TILELANG_W4A16", "0") == "1"
++            and self.config.activation == "silu"
++            and self.config.is_gated
++            and not self.config.no_combine
++            and hooks is None
++        )
++        if _use_tilelang_w4a16:
++            from quant_gemm.moe import w4a16_fused_moe_aligned
++            out = w4a16_fused_moe_aligned(
++                runner_input.hidden_states,
++                quant_info.w13_weight,
++                quant_info.w13_scale,
++                quant_info.w2_weight,
++                quant_info.w2_scale,
++                runner_input.topk_weights,
++                runner_input.topk_ids,
++                runner_input.sorted_token_ids,
++                runner_input.expert_ids,
++                runner_input.num_tokens_post_padded,
++                block_M=running_state["config"].get("BLOCK_SIZE_M", 16),
++            )
++            return TritonRunnerOutput(hidden_states=out)
++
+         out = _fused_moe_kernel_sequence(
+             runner_input.hidden_states,
+             quant_info.w13_weight,

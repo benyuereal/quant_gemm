@@ -1055,3 +1055,55 @@ sglang 在 N=6144 无 tuned config（tuned 仅 N=384 有），故 sglang-tuned =
 1. **`sgl_kernel.silu_and_mul` launch_bounds 警告**：N_inter=3072 时 `Launch params (384,1,1) > launch bounds (256)`。目前是 warning 不崩，但需查是否有替代实现或自写 tilelang silu。
 2. **小 E（<8）dcu_moe_align_block_size segfault**：dcu_align 的 expert_ids 在小 E 时输出垃圾，仅适用真实 E=128。小规模测试用 `moe_align_torch` 纯 torch 路径。
 3. **sglang 无 N=6144 tuned config**：真实维度下 sglang 走 default config（未调优），对比偏保守；若要更公平可为 N=6144 调一份 tuned config。
+
+### 27.9 待办：降 host 开销（M=1 ~790us Python op launch）
+
+`profile_host_ops.py` 逐 op 计时（M=1，不 sync 测 host 提交）host 合计 ~726us，主要开销：
+
+| op | us | 占比 |
+|---|---|---|
+| cat valid/safe/tok（pad 到 num_m_blocks×block_M） | 130 | 18% |
+| cat A_gathered（同上 pad） | 118 | 16% |
+| where(valid, w_flat[sf], 0) | 74 | 10% |
+| cd_valid × w_per_row（combine 逐元素乘） | 71 | 10% |
+| sorted_ids.to(int64) | 39 | 5% |
+| tensor nvb / A×=mask / index_add_ / dcu_align | ~100 | 14% |
+
+**最大头是两个 `torch.cat`（248us，34%）**——pad A_gathered/valid/safe_flat/tok_idx 到 `total_gem=num_m_blocks*block_M`。但 kernel 已用 `num_valid_blocks` early-exit 跳过 pad 块，**这些 cat 实际多余**（kernel 只读前 nvb×block_M ≤ ntp_val 行，A_gathered 的 total_pad 已 ≥ ntp_val）。
+
+**已验证去 cat 方案**（`/tmp/test_nopad2.py`）：C/A 行数用 `max(total_pad, nvb×block_M)` 防越界，通常无需 pad。nopad vs sglang max_diff ~1.5e-3（与原版同量级），nopad vs orig ~4.9e-4（纯 bf16 编译差异，因 total_rows 不同触发不同 kernel cache key，非 bug）。**待写入 moe.py 并测性能提升**（预计 M=1 省 ~250us，e2e 1319→~1070us）。
+
+**其他 host 优化方向**（未做）：
+- kernel 的 total_tokens/num_m_blocks 用固定上界，避免随 M 变化重编译（省 JIT lookup + cache 抖动）；但 num_m_blocks 是 grid 维度，上界浪费 block（有 early-exit 兜底）。
+- combine 的 `where + 逐元素乘 + index_add`（~170us）可合并成单个自定义 kernel，或用 scatter_add。
+- 预分配 buffer 复用（A_gathered / cache1 / cache_inter / cache_down / final），避免每帧 malloc。
+
+**注**：生产开 cuda graph 后，这些 host 开销会被 graph capture 吸收（capture 时记录一次，replay 时无 Python 开销），故 host 优化对 graph 路径收益小，主要利好非 graph 路径（prefill / 大 batch）。优先级：先做 sglang 实际替换验证端到端收益，host 优化后置。
+
+### 27.10 关键发现：dcu_moe_align_block_size 在小 E (TP=4) 产生垃圾 sorted_ids
+
+**现象**：sglang 海光版 `dcu_moe_align_block_size` 在 E<128 时输出的 `sorted_ids` / `expert_ids` 大部分是未初始化垃圾（如 1068547945、-1081393681），不是有效 token 索引或 -1。
+
+实测（M=1, topk=4, 应只有 4 个有效 token）：
+| E | sid[:ntp] 中 `< M_flat` 的数（应=4） | 状态 |
+|---|---|---|
+| 32 | 40 | 垃圾（dcu_align 残缺） |
+| 64 | 43 | 垃圾 |
+| 128 | 4 | 正常 |
+
+E=32 各 M 下都垃圾（M=8 应 32 实测 185，M=32 应 128 实测 496）。**dcu_align 只填了每 block 首位置（0,16,32,...），其余 15 行是未初始化内存**，`sid < M_flat` 误判垃圾为有效 token。
+
+**影响**：
+- **W4A16 TP=1（E=128）forward 能跑**（dcu_align 正常，tilelang 验证 PASS）。
+- **W4A16 TP=4（每卡 E=32）forward 跑不通**——这正是文档 26.9 `[ ] forward 跑通` 未完成的根因（之一）：sglang Triton int4 kernel 喂垃圾 sorted_ids/expert_ids 会越界崩（`Invalid address access` / HSAIL hardware exception）。
+- **不是 tilelang 的问题**：sglang 自己的 `_fused_moe_kernel_sequence` 在 E=32 喂同款垃圾也崩。
+
+**根因猜测**：sglang DCU 版 `op.moe_align_block_size`（HIP kernel）在小 E（E<128）时线程/grid 配置不当，未填满 sorted_ids 的 padding 行。E=128 是 M3 全量 expert，恰好避开。
+
+**解决方向**（待定）：
+1. tilelang 替换路径里**绕过 dcu_align**，用我们自己的 `moe_align_torch`（纯 torch，已验证 E=4/8/32 正确）或修好的 align kernel。但 moe_align_torch 有 71-92% overhead（见 27.6 之前），需优化或写 tilelang align kernel。
+2. 修 sglang dcu_align kernel（HIP C++，难）。
+3. TP=1 部署（E=128，dcu_align 正常），但单卡 64GB 装不下 225GB 模型，不可行。
+4. **先用 TP=1 + 单层 MoE 验证 tilelang 端到端正确**（绕过 TP=4 显存限制），再决定 TP=4 方案。
+
+**当前状态**：tilelang 算子本身在 E=128（TP=1 语义）正确性 + 性能已验证（27.5-27.6），可安全替换 sglang Triton int4。**阻塞点在 sglang dcu_align 的 E=32 bug，需先解决才能 TP=4 部署。**

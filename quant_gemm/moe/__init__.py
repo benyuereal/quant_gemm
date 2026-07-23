@@ -16,7 +16,13 @@
 
 from .kernels import w4a16_grouped_gemm, GROUP
 from .quant import quantize_int4_per_group, dequant_int4_per_group, DTYPE
-from .moe import w4a16_fused_moe, tilelang_fused_moe_simple, moe_align_torch, build_route_tables
+from .moe import (
+    w4a16_fused_moe,
+    tilelang_fused_moe_simple,
+    w4a16_fused_moe_aligned,
+    moe_align_torch,
+    build_route_tables,
+)
 
 __all__ = [
     "w4a16_grouped_gemm",
@@ -24,6 +30,7 @@ __all__ = [
     "dequant_int4_per_group",
     "w4a16_fused_moe",
     "tilelang_fused_moe_simple",
+    "w4a16_fused_moe_aligned",
     "moe_align_torch",
     "build_route_tables",
     "GROUP",
