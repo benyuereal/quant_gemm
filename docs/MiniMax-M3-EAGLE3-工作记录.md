@@ -331,3 +331,47 @@ eager 模式 (disable-cuda-graph) 下 1.5x (5→7.5 tok/s), accept~0.4. 开 cuda
 
 **INT4 draft 适配性**: DCU (gfx936) 无 NVIDIA `gptq_marlin_repack`, 任何 int4 dense draft
 (走 compressed-tensors W4A16 GPTQ Marlin 路径) 都加载崩. 只能用 BF16 draft.
+
+---
+
+## 十、待办: AWQ INT4 target 配 BF16 draft (未实测)
+
+### 背景
+另有一份 AWQ INT4 量化 target (`/models/MiniMax-M3-AWQ-INT4`), 全模型量化 (compressed-tensors
+pack-quantized, observer=mse, group=32, 非对称 int8 zp, W4). 评估能否复用现有 BF16 draft
+(`Inferact/MiniMax-M3-EAGLE3`) 跑 EAGLE3 投机解码. **DCU int4 dense 加载已单独解决 (target 可独立推理).**
+
+### 可行性预估 (耦合点 3 项)
+| 耦合点 | AWQ INT4 target 情况 | 与 BF16 draft | 风险 |
+|---|---|---|---|
+| hidden_size / vocab / 60层 / VL类 | 6144 / 200064 / 60 / `MiniMaxM3SparseForConditionalGeneration` | 完全一致 | ✅ 无 |
+| DCU int4 dense 加载 | 已解决 (target 单独可跑) | — | ✅ 无 |
+| **aux 层 dtype** | 第2层在 ignore → bf16; 第30/57层 dense 被量化 int4 → 反量化后**可能 float32** | draft FC 是 bf16 | ⚠️ **唯一风险** |
+
+aux 层号仍为 `[2,30,57]` (N=60). 关键区别:
+- **现在 W4A16 moe-only**: dense 全 bf16 → 3 个 aux 全 bf16 → draft FC 无 dtype 问题.
+- **AWQ INT4**: 前3层(lay 0-2)在 ignore 列表保持 bf16, 其余 dense 层(lay 3-59)int4.
+  所以 aux 中**第2层 bf16, 第30/57层可能 float32**.
+
+### 风险点 (记录, 不预先改)
+若 AWQ 反量化路径输出 float32 aux, 会在 `llama_eagle3.py` 的 `self.fc(hidden_states)`
+(line 225, hidden 来自 `forward_batch.spec_info.hidden_states` line 217) 报
+`expected mat1 and mat2 to have the same dtype`. 概率估约 50/50 (sglang 部分反量化路径会
+cast 回模型 dtype, 不一定留 float32, 需实测确认).
+
+**待实测确认后再决定是否打 patch**, 不预先改 (避免对已验证通过的 W4A16 路径引入风险).
+若实测报 dtype mismatch, 需加的 cast (沿用 fork tails-mpt 验证过的方案, 3 处, patch 规范同 5.1):
+1. `srt/models/llama_eagle3.py` line ~217: `forward_batch.spec_info.hidden_states` 喂 `self.fc` 前 cast 到 draft dtype (`self.embed_tokens.weight.dtype`).
+2. `srt/models/llama_eagle3.py` line ~212: embeds cast 到 draft dtype (embed 共享自 target, 本应 bf16, 保险).
+3. `srt/models/minimax_m3_vl.py` line ~244: aux unpack 后立即 cast 到 `self.lm_head.weight.dtype` (lm_head 在 ignore → bf16), 从源头统一 aux 为 bf16, 下游 logits_processor / draft 全 bf16.
+
+### accept 预估
+AWQ 有校准 (mse observer), hidden 分布比 RTN 接近原模型; 但 draft 训练于 MXFP8 target,
+与 AWQ int4 hidden 分布不完全一致. 预估 accept **0.6~0.8**, 吞吐净收益取决于 accept × draft 开销,
+需实测. (现 W4A16 + cuda graph: accept 0.78, 21.7 tok/s.)
+
+### 行动项 (待办)
+- [ ] 用现有 `minimax_w4a16_eagle3.sh` 改 target 路径指向 AWQ INT4, 实测能否起服务 + 推理正常
+- [ ] 若起服务即报 dtype mismatch → 打上述 3 处 cast patch (先备份 `llama_eagle3.py` 原始版到 `sglang_backup/`)
+- [ ] 实测 accept / 吞吐, 与 W4A16 (0.78 / 21.7 tok/s) 对比
+- [ ] 对比 AWQ INT4 target 单独推理精度 (gpqa 等) 与 W4A16 moe-only, 确认精度不降 (用户硬约束: 保持精度)

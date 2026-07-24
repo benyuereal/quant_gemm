@@ -503,7 +503,7 @@ curl /v1/chat/completions  "用中文写一首关于秋天的短诗"
 → <mm:think>...草拟多版... 秋风起时，黄叶飘落。冷露凝结，寒霜降临。孤雁南归...  ✅ finish_reason=length
 ```
 
-GitHub 仓库：https://github.com/benyuereal/quant_gemm （含 quant_gemm 算子包 + sglang_patches）
+GitHub 仓库：https://github.com/benyuereal/quant_gemm （含 sglang_patches 补丁 + quantization 量化脚本；早期自写 tilelang W8A8 算子包 `quant_gemm/` 已移除, 未接入服务路径, 见二十一章）
 
 ## 十四、方案转折：从 W4A8/lightop 到 W8A8/tilelang
 
@@ -530,7 +530,7 @@ GitHub 仓库：https://github.com/benyuereal/quant_gemm （含 quant_gemm 算�
 ### 14.3 MoE 算子策略：复用 sglang 原生 Triton kernel
 
 关键发现：sglang 原生 `fused_moe_kernel`（Triton）**已支持 `use_int8_w8a8` + `per_channel_quant`**，缺的只是一个 MoE scheme 接上海光分支。
-故**不用** quant_gemm 的 MoE kernel（备份方案），而是新写 scheme 复用 sglang Triton runner——能复用 sglang 全套 MoE 基础设施（路由、combine、a2a），工作量小得多。
+故**不用**自写 tilelang MoE kernel，而是新写 scheme 复用 sglang Triton runner——能复用 sglang 全套 MoE 基础设施（路由、combine、a2a），工作量小得多。（早期写的 `quant_gemm/` tilelang W8A8 算子包即因此备份方案, 后已移除, 见二十一章。）
 
 ## 十五、量化过程：W8A8 moe-only 怎么做的
 
@@ -720,29 +720,28 @@ MiniMax sparse attention 的 `_gqa_share_sparse_fwd_kernel`（prefill）和 `_gq
 
 实际走"复用 sglang 原生 Triton MoE kernel"路径（而非自写 tilelang MoE 接 sglang），省了工作块 1 的大部分（fuse swiglu/路由对齐由 sglang runner 处理）。主要工作量在**联调阶段排查 12 个坑**（尤其 sparse attn 共享内存、磁盘、Triton 缓存）。整体约 1-2 天跑通（含前期 tilelang 算子验证 + 量化 + sglang 补丁）。
 
-## 二十一、安装包与测试目录
+## 二十一、仓库结构与测试目录
 
-### 20.1 安装包 `quant_gemm`（`/models/quant_gemm_pkg/`）
+### 21.1 仓库结构 `quant_gemm_pkg`（`/models/quant_gemm_pkg/`）
 
 ```
 quant_gemm_pkg/
-├── quant_gemm/
-│   ├── __init__.py     # 导出 API
-│   ├── kernels.py      # w8a8_per_channel_gemm, moe_w8a8_grouped_gemm (tilelang)
-│   ├── quant.py        # per_token_sym_int8, per_channel_sym_int8
-│   └── api.py          # w8a8_linear, w8a8_moe (高层 API, kernel 缓存)
-├── pyproject.toml / setup.py / README.md
-└── sglang_patches/     # sglang 6 处补丁 + README
+├── sglang_patches/     # sglang 补丁 (W8A8/W4A16 MoE 适配 + EAGLE3) + README
+├── quantization/       # 量化脚本 (minimax_m3_w4a8.py / w4a16.py + 启动脚本)
+└── docs/               # 工作记录
 ```
 
-安装：`cd /models/quant_gemm_pkg && pip install -e . --no-deps --no-build-isolation`（用 --no-deps 避开 tilelang 的 tvm-ffi 版本校验冲突，依赖已装）。
-任意目录 `from quant_gemm import w8a8_linear, w8a8_moe` 可用。回归测试 `test/test_quant_gemm_package.py` 通过。
+> **关于 `quant_gemm/` 算子包（已移除）**: 早期为 W8A8 自写过一套 tilelang GEMM 算子包
+> (`kernels.py` / `quant.py` / `api.py`, 导出 `w8a8_linear`/`w8a8_moe`), 作为 sglang 适配的
+> 备份方案。但最终 W8A8 走 sglang 原生 Triton `fused_moe_kernel` (见 14.3), 该算子包**从未接入
+> 服务路径**, 故已移除 (`quant_gemm/` + `setup.py` + `pyproject.toml` + 回归测试
+> `test/test_quant_gemm_package.py` 一并删除)。tilelang 写法备忘见第二十四章 (对后续 W4A8 待办
+> 仍有参考)。
 
-### 20.2 测试目录 `/models/test/`
+### 21.2 测试目录 `/models/test/`
 
 | 脚本 | 用途 |
 |---|---|
-| `test_quant_gemm_package.py` | 安装包回归测试（调 pip 装好的包，高层 API） |
 | `test_tilelang_w8a8.py` | Linear W8A8 独立验证（内联 kernel，vs deq 0.28%） |
 | `test_tilelang_moe_w8a8.py` | MoE W8A8 独立验证（内联 kernel，路由表） |
 | `test_lightop_w8a8.py` | lightop W8A8 验证（gfx936 only） |
@@ -752,7 +751,7 @@ quant_gemm_pkg/
 
 ## 二十二、启动与测试
 
-### 21.1 启动
+### 22.1 启动
 
 `/models/minimax.sh`（自动：停残留 sglang → 清 triton/torchinductor 缓存 → 启动 → 日志覆盖到 `/models/sglang_serve.log`）：
 ```bash
@@ -762,7 +761,7 @@ bash /models/minimax.sh
 关键参数：`--tp-size 8 --mem-fraction-static 0.85 --context-length 4096 --max-total-tokens 4096 --attention-backend triton --mm-attention-backend triton_atn --disable-cuda-graph --skip-server-warmup`。
 环境变量：`SGLANG_USE_AITER=0`（纯 Triton），`PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`，`TMPDIR/TORCHINDUCTOR_CACHE_DIR/TRITON_CACHE_DIR` 指到 /models。
 
-### 21.2 测试
+### 22.2 测试
 
 ```bash
 curl -N http://127.0.0.1:8080/v1/chat/completions -H "Content-Type: application/json" \
@@ -786,6 +785,9 @@ curl -N http://127.0.0.1:8080/v1/chat/completions -H "Content-Type: application/
 - **绝不能在 sglang 容器装 llmcompressor**（会升级海光定制 torch 致环境崩，见第十二章）
 
 ## 二十四、tilelang 写法备忘（踩过的坑）
+
+> 以下为早期自写 `quant_gemm/` tilelang W8A8 算子时踩的坑 (该包已移除, 见 21.1)。备忘保留: 对后续
+> W4A8/W4A16 tilelang 算子待办 (见二十五章) 仍有参考价值。
 
 - 条件控制流：`T.If`/`T.Else`（大写上下文管理器），不是 `T.if_`；循环 `T.Serial` 不是 `T.serial`
 - 避开 kernel 内控制流：路由表 Python 端预算传入，kernel 直接索引（比 T.If 查找 expert 稳）
