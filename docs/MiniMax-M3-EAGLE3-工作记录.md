@@ -251,7 +251,7 @@ eager 模式 (disable-cuda-graph) 下 1.5x (5→7.5 tok/s), accept~0.4. 开 cuda
   - 注意: `prepare_server_args` (server_args.py:7683) 的 parser 是 `prog="sglang serve"`,
     直接 `parser.parse_args(argv)`, **不需要 `serve` 子命令前缀** (那是 `sglang` CLI 的子命令,
     不是 launch_server 的)。所以 `--model-path` 直接起头。
-- `PYTHONPATH` 加上 patch 目录: `/models/quant_gemm_pkg/sglang_patches/added`
+- `PYTHONPATH` 加上 patch 目录: `/models/quant-eagle3-hygon/sglang_patches/added`
 
 ### 6.2 EAGLE3 配置 (README 验证过的 greedy 配置)
 | 参数 | 值 | 说明 |

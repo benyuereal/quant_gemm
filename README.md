@@ -7,7 +7,7 @@ MiniMax-M3 在海光 DCU (gfx936 / gfx928) 上的 **W8A8 / W4A16 moe-only 量化
 ## 项目结构
 
 ```
-quant_gemm_pkg/
+quant-eagle3-hygon/
 ├── sglang_patches/      # sglang 补丁 (海光 W8A8/W4A16 MoE 适配 + EAGLE3)
 │   ├── added/           #   新增 W8A8 MoE scheme (复用 sglang 原生 Triton kernel)
 │   ├── modified/        #   改动文件 + .patch (compressed_tensors/int8_kernel/sparse attn/wNa16_moe/eagle3)

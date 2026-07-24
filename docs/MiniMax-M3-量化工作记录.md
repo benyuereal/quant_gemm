@@ -503,7 +503,7 @@ curl /v1/chat/completions  "用中文写一首关于秋天的短诗"
 → <mm:think>...草拟多版... 秋风起时，黄叶飘落。冷露凝结，寒霜降临。孤雁南归...  ✅ finish_reason=length
 ```
 
-GitHub 仓库：https://github.com/benyuereal/quant_gemm （含 sglang_patches 补丁 + quantization 量化脚本；早期自写 tilelang W8A8 算子包 `quant_gemm/` 已移除, 未接入服务路径, 见二十一章）
+GitHub 仓库：https://github.com/benyuereal/quant-eagle3-hygon （含 sglang_patches 补丁 + quantization 量化脚本；早期自写 tilelang W8A8 算子包 `quant_gemm/` 已移除, 未接入服务路径, 见二十一章）
 
 ## 十四、方案转折：从 W4A8/lightop 到 W8A8/tilelang
 
@@ -645,7 +645,7 @@ if moe_only and ".block_sparse_moe.experts." not in weight_name:
 
 ## 十七、改了 sglang 哪里（6 处补丁）
 
-补丁归档：`/models/quant_gemm_pkg/sglang_patches/`（含改后文件 + .patch + README），已 push GitHub。
+补丁归档：`/models/quant-eagle3-hygon/sglang_patches/`（含改后文件 + .patch + README），已 push GitHub。
 
 | # | 文件 | 类型 | 改动 |
 |---|---|---|---|
@@ -722,10 +722,10 @@ MiniMax sparse attention 的 `_gqa_share_sparse_fwd_kernel`（prefill）和 `_gq
 
 ## 二十一、仓库结构与测试目录
 
-### 21.1 仓库结构 `quant_gemm_pkg`（`/models/quant_gemm_pkg/`）
+### 21.1 仓库结构 `quant-eagle3-hygon`（`/models/quant-eagle3-hygon/`）
 
 ```
-quant_gemm_pkg/
+quant-eagle3-hygon/
 ├── sglang_patches/     # sglang 补丁 (W8A8/W4A16 MoE 适配 + EAGLE3) + README
 ├── quantization/       # 量化脚本 (minimax_m3_w4a8.py / w4a16.py + 启动脚本)
 └── docs/               # 工作记录
@@ -780,8 +780,8 @@ curl -N http://127.0.0.1:8080/v1/chat/completions -H "Content-Type: application/
 - W8A8 量化产物：`/models/MiniMax/MiniMax-M3-w8a8-moe-only`（412GB，59 shard）
 - 量化脚本：`/models/llm-compressor/examples/one_click_quant/templates/minimax_m3_w4a8.py`（`--quant-type int8 --moe-only`）
 - tilelang 示例：`/models/tilelang/examples/`（gemm/, fusedmoe/, dequantize_gemm/w4a8）
-- 启动脚本：`/models/minimax.sh`；sglang 补丁：`/models/quant_gemm_pkg/sglang_patches/`
-- GitHub：https://github.com/benyuereal/quant_gemm
+- 启动脚本：`/models/minimax.sh`；sglang 补丁：`/models/quant-eagle3-hygon/sglang_patches/`
+- GitHub：https://github.com/benyuereal/quant-eagle3-hygon
 - **绝不能在 sglang 容器装 llmcompressor**（会升级海光定制 torch 致环境崩，见第十二章）
 
 ## 二十四、tilelang 写法备忘（踩过的坑）

@@ -14,7 +14,7 @@
    且 _max_seqlen_q 正确 (坑 B/C: max(None) / .device 崩).
 
 跑法:
-    cd /models/quant_gemm_pkg/sglang_patches/tests
+    cd /models/quant-eagle3-hygon/sglang_patches/tests
     python3 test_m3_eagle3_verify_sparse.py
 """
 
