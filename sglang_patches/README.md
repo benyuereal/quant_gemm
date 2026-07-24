@@ -15,6 +15,7 @@
 | 文件 | 类型 | 改动 |
 |---|---|---|
 | `added/compressed_tensors_w8a8_int8_triton_moe.py` | **新增** | 海光 W8A8 MoE scheme, 复用 sglang 原生 Triton fused_moe kernel |
+| `added/sitecustomize.py` | **新增** | transformers 5.6.0 注册 `minimax_m3_sparse` 自定义层类型 (sglang dev 已支持 M3, transformers 未跟进, 否则 config 校验报 `Unknown layer type`) |
 | `modified/compressed_tensors.py` | 改动 | ① MoE W8A8 海光分支 raise→return 新 scheme; ② Linear W8A8 海光下走 bf16 (moe-only) |
 | `modified/schemes/__init__.py` | 改动 | 导出新 scheme |
 | `modified/int8_kernel.py` | 改动 | `per_token_quant_int8` 的 round: `tl.extra.cuda.libdevice` → `tl.extra.hip.libdevice` |
@@ -116,9 +117,13 @@ configs=[
 
 ```bash
 SG=/usr/local/lib/python3.10/dist-packages/sglang/srt
+SP=/usr/local/lib/python3.10/dist-packages
 # 新增文件
 cp added/compressed_tensors_w8a8_int8_triton_moe.py \
    $SG/layers/quantization/compressed_tensors/schemes/
+# sitecustomize.py — 装到 site-packages 根目录 (非 sglang 子目录),
+# Python 解释器启动时自动加载, 早于任何 import, 在模型 config 校验前完成补丁
+cp added/sitecustomize.py $SP/sitecustomize.py
 # 改动文件 (直接覆盖, 或用 patch)
 cp modified/compressed_tensors.py $SG/layers/quantization/compressed_tensors/
 cp modified/schemes___init__.py $SG/layers/quantization/compressed_tensors/schemes/__init__.py
@@ -127,6 +132,41 @@ cp modified/topk_sparse_prefill.py $SG/layers/attention/minimax_sparse_ops/prefi
 cp modified/topk_sparse_decode.py $SG/layers/attention/minimax_sparse_ops/decode/topk_sparse.py
 # 清 triton 缓存 (改过 kernel 后必须清)
 rm -rf /models/.triton_cache/* ~/.triton/* /tmp/torchinductor_root
+```
+
+## 8. `sitecustomize.py` — 注册 `minimax_m3_sparse` 层类型
+
+**背景**: sglang dev build 已支持 MiniMax-M3, 但配套的 transformers 5.6.0 还没把
+`minimax_m3_sparse` 这个自定义 layer type 注册进 `ALLOWED_LAYER_TYPES`. 加载模型
+config 时 `transformers.configuration_utils` 校验 layer type 不在白名单就抛
+`ValueError: Unknown layer type <class '...minimax_m3_sparse'>`, 启动即失败.
+
+**做法**: 一个 monkey-patch, 在任何模型 import 之前把该类型追加进白名单:
+```python
+import transformers.configuration_utils as _cu
+if "minimax_m3_sparse" not in _cu.ALLOWED_LAYER_TYPES:
+    _cu.ALLOWED_LAYER_TYPES = _cu.ALLOWED_LAYER_TYPES + ("minimax_m3_sparse",)
+```
+
+**为什么用 `sitecustomize.py` 而不是改 sglang 代码 / 改 config**:
+- 必须在 `transformers` 被 import 之前生效, 改 sglang 代码时机太晚 (transformers 早被 import).
+- 改量化产物的 config.json 不行 — `ALLOWED_LAYER_TYPES` 是 transformers 源码硬编码的白名单,
+  config 里写什么都会被拒.
+- `sitecustomize.py` 是 Python 解释器启动时自动加载的钩子 (只要所在目录在 `sys.path` 中),
+  早于一切业务 import, 是注入这种"启动前 patch"的标准位置.
+
+**部署位置 (交付容器必须注意)**:
+- **装到 site-packages 根目录**: `/usr/local/lib/python3.10/dist-packages/sitecustomize.py`
+  (上面应用补丁脚本已含). site-packages 永远在 `sys.path` 中, 容器内固定, 不受工作目录变化影响.
+- **不要依赖 PYTHONPATH 指向工作目录** (如 `export PYTHONPATH=/workspace:$PYTHONPATH`):
+  交付给用户的容器工作目录会变 (用户可能挂到别处), 这样 sitecustomize 加载不到, 补丁失效.
+  容器化交付的正确做法是把补丁固化进 site-packages, 让工作目录可变.
+- `try/except` 兜底: transformers 缺失 / 已注册 / 接口变动都不影响主流程.
+
+**验证**:
+```bash
+python3 -c "import sitecustomize, transformers.configuration_utils as c; print('minimax_m3_sparse' in c.ALLOWED_LAYER_TYPES)"
+# True
 ```
 
 ## 启动
