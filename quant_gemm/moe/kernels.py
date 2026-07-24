@@ -40,9 +40,11 @@ def w4a16_grouped_gemm(
     输出 C [total_tokens, N] bf16.
     block_K = group_size (每 K group 一个 scale, 索引简单).
     路由通过 block_to_expert/block_m_start/block_actual_rows 表传入 (同 W8A8 框架).
-    num_valid_blocks: 有效 block 数 (sglang num_tokens_post_padded//block_M), 超出的 block
-        (padding 块, expert_ids 是未初始化垃圾) 直接跳过 GEMM, 与 sglang early-return 等价.
-        这是小 batch 性能关键: M=1 时 121 个 block 只有 4 个有效, 跳过 117 个垃圾块.
+    num_tokens_post_padded: 有效 token 数 (sglang _prepare_fused_moe_run 输出). kernel 内算
+        num_valid_blocks = ceildiv(ntp, block_M), 超出的 padding 块直接跳过 GEMM (与 sglang
+        `if pid_m*BLOCK_M >= num_tokens_post_padded: return` 等价). 传 tensor 不在 host 算,
+        避免 .item() (cuda graph capture 兼容). 小 batch 性能关键: M=1 时 121 个 block 只有
+        4 个有效, 跳过 117 个垃圾块.
 
     Args:
         E: expert 数.
@@ -75,13 +77,13 @@ def w4a16_grouped_gemm(
         block_to_expert: T.Tensor((num_m_blocks,), T.int32),
         block_m_start: T.Tensor((num_m_blocks,), T.int32),
         block_actual_rows: T.Tensor((num_m_blocks,), T.int32),
-        num_valid_blocks: T.Tensor((1,), T.int32),                     # 有效 block 数, 超出跳过
+        num_tokens_post_padded: T.Tensor((1,), T.int32),               # 有效 token 数, kernel 内算 nvb 跳过 pad 块
         C: T.Tensor((total_tokens, N), out_dtype),
     ):
         with T.Kernel(num_m_blocks, num_n_blocks, threads=threads) as (bx, by):
             # 跳过 padding 块 (与 sglang `if pid_m*BLOCK_M >= num_tokens_post_padded: return` 等价).
-            # 这些块的 block_to_expert 是未初始化垃圾, 跑 GEMM 会浪费且写垃圾 (靠 combine 权重 0 抵消).
-            if bx < num_valid_blocks[0]:
+            # num_valid_blocks = ceildiv(num_tokens_post_padded, block_M), kernel 内算, 避免 host .item() (cuda graph 兼容).
+            if bx * block_M < num_tokens_post_padded[0]:
                 A_shared = T.alloc_shared((block_M, block_K), in_dtype)
                 W_shared = T.alloc_shared((block_N, block_K // num_elems_per_byte), storage_dtype)
                 B_local = T.alloc_local([local_size_compressed], storage_dtype)

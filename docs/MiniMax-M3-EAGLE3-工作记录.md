@@ -1,7 +1,11 @@
 # MiniMax-M3 EAGLE3 投机解码工作记录
-> 创建日期: 2026-07-23
-> 目标: 在海光 DCU (gfx928) 上给 W4A16 moe-only 量化的 MiniMax-M3 接 EAGLE3 投机解码
+> 创建日期: 2026-07-23 ｜ 更新: 2026-07-23 (cuda graph 适配完成, 4x 加速)
+> 目标: 在海光 DCU (gfx936 / BW100) 上给 W4A16 moe-only 量化的 MiniMax-M3 接 EAGLE3 投机解码
 > 关联: `MiniMax-M3-量化工作记录.md` (量化本体) ｜ sglang dev12695 (DCU dtk2604 build)
+>
+> **最终成果**: 纯 W4A16 eager 5 tok/s → EAGLE3 + cuda graph **16-22 tok/s (峰 21.7)**, accept 0.78,
+> 输出正确 (纯文本, 不乱码不复读). = **4x over eager, 1.7x over 纯 W4A16 cuda graph (13 tok/s)**.
+> Draft: `Inferact/MiniMax-M3-EAGLE3` (BF16, MXFP8 target 训, 与我们 W4A16 不一致但实测 accept 仍 0.78).
 
 ---
 
@@ -143,10 +147,14 @@ layer 上的 `_is_layer_to_capture=True`**。
 - ✅ sglang 参数解析: EAGLE3 归一化 num_steps=3 / topk=1 → num_draft_tokens=4 (=steps+1) 正确
 - ✅ 幂等: 重复 import 不报错
 
-### 5.5 未验证 (需实际起服务, 加载 225G ~3min)
-- DCU 上 draft worker 实际加载 (可能还有 DCU 特定 cuda graph / attention backend 问题)
-- 实际接受率 (预期因 MXFP8 vs W4A16 精度差异偏低)
-- 实际加速比 (W4A16 瓶颈是 MoE int4 GEMM, spec decode 可能加速比打折 — 见 `minimax-m3-perf-bottleneck`)
+### 5.5 实测验证结果 (已全部验证)
+- ✅ DCU 上 draft worker 加载成功 (`LlamaForCausalLMEagle3`, 2.2GB/卡)
+- ✅ verify 阶段执行正常, 输出正确 (纯文本不乱码不复读)
+- ✅ 接受率 accept 0.78 (eager 0.4 → cuda graph 0.78, 接近 README 的 0.84)
+- ✅ 加速比: eager 1.5x (5→7.5), cuda graph **4x (5→21.7)** — 见 5.6
+- 注: W4A16 瓶颈是 MoE int4 GEMM, 但 cuda graph 消掉 launch 开销后 spec decode 收益放大,
+  实际加速远超之前 "MoE 瓶颈可能打折" 的预期. draft 训练 target (MXFP8) 与我们 (W4A16)
+  不一致, 但实测 accept 仍 0.78, 说明 hidden 分布差异影响有限.
 
 ### 5.6 cuda graph 适配 (最终性能突破)
 
@@ -264,12 +272,21 @@ eager 模式 (disable-cuda-graph) 下 1.5x (5→7.5 tok/s), accept~0.4. 开 cuda
 
 ---
 
-## 七、待办 / 风险
+## 七、待办 / 风险 (现状)
 
-1. **实测 DCU 加载**: 起 `minimax_w4a16_eagle3.sh`, 看日志确认 draft worker 加载 + spec 调度生效 (关注 `Mean accept length` / `draft accept rate` 及有无 DCU 特定报错)
-2. **接受率风险**: draft 为 MXFP8 target 训, 我们 W4A16 target 精度不同, 接受率可能 <60%。若太低需用我们的 W4A16 target 重训 draft (TorchSpec/SpecForge 流程, 成本高)
-3. **加速比风险**: W4A16 瓶颈是 MoE int4 GEMM (16.9 tok/s), EAGLE3 每个 verify step 也调 MoE, 加速比可能远低于 README 的 1.7-2.1x, 甚至 MoE 调度开销大时更低。需对比 baseline 实测
-4. **text-only 类 EAGLE3 仍断**: 本 patch 只修 VL 类。若将来用 text-only M3 (`MiniMaxM3SparseForCausalLM`), 其 `set_eagle3_layers_to_capture` 同样缺 setattr layer 那步, 需另补 (但当前量化产物用 VL 类, 暂不需要)
+1. ~~实测 DCU 加载~~ ✅ 已验证: draft worker 加载 + spec 调度 + verify 全部正常.
+2. ~~接受率风险~~ ✅ 实测 accept 0.78 (eager 0.4, cuda graph 0.78), 远超 "<60%" 预期.
+   draft (MXFP8 训) 与 W4A16 target 不一致的影响有限, 无需重训.
+3. ~~加速比风险~~ ✅ 实测 4x (5→21.7 tok/s), 远超 "可能远低于 1.7-2.1x" 预期.
+   cuda graph 消掉 MoE launch 开销后, spec decode 收益放大.
+4. **text-only 类 EAGLE3 仍断**: 本 patch 只修 VL 类. 若将来用 text-only M3
+   (`MiniMaxM3SparseForCausalLM`), 其 `set_eagle3_layers_to_capture` 同样缺 setattr layer
+   那步, 需另补 (当前量化产物用 VL 类, 不需要).
+5. **视觉请求 + EAGLE3 未测**: 纯文本已验证正常. 图片/视频请求走同一 `MiniMaxM3Model.forward`,
+   aux 捕获逻辑一致, 理论上能跑, 但 draft 训练时未见视觉 hidden → accept 可能掉.
+   不会硬报错 (大概率), 但 spec 收益打折. 若需视觉+EAGLE3, 要单独验证 accept.
+6. **2x+ 进一步提升**: 现成 draft 已是最佳 (无适配 moe-only W4A16 的现成货, 见九).
+   要更高只有重训 draft (TorchSpec, 成本高, DCU 跑训练流程有障碍) — 非当前优先级.
 
 ---
 
@@ -277,7 +294,40 @@ eager 模式 (disable-cuda-graph) 下 1.5x (5→7.5 tok/s), accept~0.4. 开 cuda
 
 | 文件 | 作用 |
 |---|---|
-| `/models/Inferact/MiniMax-M3-EAGLE3/` | draft head (下载) |
-| `/models/quant_gemm_pkg/sglang_patches/added/minimax_m3_vl_eagle3.py` | EAGLE3 monkey-patch |
-| `/models/minimax_w4a16_eagle3.sh` | 启动脚本 (端口 8081) |
+| `/models/Inferact/MiniMax-M3-EAGLE3/` | draft head (下载, BF16, 6.5GB) |
+| `/models/minimax_w4a16_eagle3.sh` | 启动脚本 (端口 8081, cuda-graph-max-bs=8) |
 | `/models/sglang_w4a16_eagle3.log` | 运行日志 |
+
+**sglang patch** (直接改 site-packages, 备份 + modified/.patch 规范):
+
+| 文件 (site-packages) | 备份 | modified/.patch | 改动 |
+|---|---|---|---|
+| `srt/models/minimax_m3_vl.py` | `sglang_backup/minimax_m3_vl.py` | `sglang_patches/modified/minimax_m3_vl.py{,.patch}` | VL 类 EAGLE3 接口 (5.2) |
+| `srt/layers/attention/minimax_sparse_backend.py` | `sglang_backup/minimax_sparse_backend.py` | `sglang_patches/modified/minimax_sparse_backend.py{,.patch}` | verify 字段补全 + seq_lens 语义 + cuda graph 7 处 (5.6/5.7) |
+| `srt/layers/attention/minimax_sparse_ops/common/utils.py` | `sglang_backup/utils.py` | `sglang_patches/modified/utils.py{,.patch}` | get_cu_seqblocks graph-safe (5.6-5) |
+
+**测试**: `sglang_patches/tests/test_m3_eagle3_verify_sparse.py` (不起服务, 验证 verify 字段补全逻辑).
+
+**回滚**: `cp /models/sglang_backup/<file> /usr/local/lib/python3.10/dist-packages/sglang/<原路径>`.
+
+---
+
+## 九、Draft 选型排查 (确认现成 draft 无适配货)
+
+为提升 accept (eager 阶段 0.4), 排查了 HuggingFace 所有 MiniMax-M3 EAGLE3 draft (7 个):
+
+| Draft | 训练 target | 对我们 moe-only W4A16 | 结论 |
+|---|---|---|---|
+| `Inferact/MiniMax-M3-EAGLE3` (采用) | MXFP8 (FP8 全模型) | 不一致, 但实测 accept 0.78 | ✅ 最佳现成选择 |
+| `Sebesky/MiniMax-M3-EAGLE3-RTN-INT4` | GPTQ (int4 全模型) | 更不一致 + draft 自身 int4 | ❌ DCU 加载崩 (无 `gptq_marlin_repack`), 已删 |
+| `Inferact/MiniMax-M3-EAGLE3-GQA` | MXFP8 (GQA 架构对齐) | target 同 MXFP8, 提升不确定 | 未测 (MHA 版已够) |
+| `Inferact/MiniMax-M3-EAGLE3-GQA-NVFP4` | MXFP8 + NVFP4 (NVIDIA) | 硬件不匹配 | ❌ |
+| `amd/MiniMax-M3-EAGLE3.1` | MXFP4, MI350X 专用 | 硬件不匹配 (gfx936) | ❌ |
+| `tonjum/...-GGUF` | GGUF (llama.cpp) | 格式不对 | ❌ |
+
+**结论**: 没有适配 moe-only W4A16 RTN 的现成 draft (我们自己量化的, 没人专门训).
+现有 `Inferact/MiniMax-M3-EAGLE3` 已是最佳, cuda graph 下 accept 0.78 接近 README 的 0.84,
+无需换. 2x+ 进一步提升只有重训 draft (见七-6).
+
+**INT4 draft 适配性**: DCU (gfx936) 无 NVIDIA `gptq_marlin_repack`, 任何 int4 dense draft
+(走 compressed-tensors W4A16 GPTQ Marlin 路径) 都加载崩. 只能用 BF16 draft.

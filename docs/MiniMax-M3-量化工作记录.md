@@ -1107,3 +1107,25 @@ E=32 各 M 下都垃圾（M=8 应 32 实测 185，M=32 应 128 实测 496）。*
 4. **先用 TP=1 + 单层 MoE 验证 tilelang 端到端正确**（绕过 TP=4 显存限制），再决定 TP=4 方案。
 
 **当前状态**：tilelang 算子本身在 E=128（TP=1 语义）正确性 + 性能已验证（27.5-27.6），可安全替换 sglang Triton int4。**阻塞点在 sglang dcu_align 的 E=32 bug，需先解决才能 TP=4 部署。**
+
+### 27.11 待办：tilelang W4A16 替换 sglang 的遗留问题（暂停）
+
+**状态**：tilelang 替换 sglang Triton int4 MoE 在真实服务（TP=4, E=128, cuda graph）下输出乱码，**暂停**，回退 sglang 原生 Triton int4 + cuda graph。
+
+**已验证可用**：
+- 单卡裸调（E=128, 随机/真实产物权重）：tilelang vs sglang max_diff<1e-3，性能 M=1 2.51x ~ M=32 4.92x（`bench_perf.py` / `verify_real_weights.py`）。
+- M=1-128 裸调正确性 PASS。
+
+**真实服务乱码根因（已定位部分）**：
+1. **grid 维度用错**（已修）：`w4a16_fused_moe_aligned` 之前用 `expert_ids.numel()` 作 grid，大 M 时 `eid_len << sid_len/16`（裸调 M=178: eid=138 但 sid/16=549），少跑 400+ block → 乱码。改用 `cdiv(total_pad, block_M)` + eid pad 0。但真实服务 sid_len=2632（非裸调的 8776，因 `num_token` 参数不同），eid_len=165=cdiv(sid,16) 本就够，此修复在真实服务无作用。
+2. **routed_scaling_factor 漏乘**（已修）：M3 `routed_scaling_factor=2.0`，sglang combine 的 `moe_sum_reduce_triton(..., routed_scaling_factor)` 乘了，我们 `index_add` 没乘 → 输出差 2x。已加 `routed_scaling_factor` 参数并在 combine 乘。但重启后 max_diff 仍大（12-43），说明不是主因。
+3. **未定位**：真实服务 M=178 `tl_mean` 比 `sgl_mean` 小 7-14 倍且比值不固定（0.07~0.46），非单纯系数差，像根本性计算错误。怀疑：sorted_ids 在真实服务的垃圾分布与裸调不同（真实 sid_len=2632 vs 裸调 8776），`valid` mask 误判垃圾 sid 为有效 → gather 错误 token。裸调无法复现（align 的 `num_token` 参数差异）。
+
+**调试手段**：`fused_moe.py` 补丁加 `TILELANG_DEBUG=1` 同时跑 sglang 原生对比，dump max_diff/sid_valid/eid_len/rsf。`minimax_w4a16.sh` 设 `SGLANG_USE_TILELANG_W4A16=1` + `TILELANG_DEBUG=1` + `--disable-cuda-graph`。
+
+**下一步（恢复时）**：
+- 在真实服务 dump sorted_ids 实际值分布（sid_valid/sid_neg/sid_ge_Mflat 已加调试），确认是否垃圾 sid 落在 [0,M_flat) 被 valid 误判。
+- 若是，改用 sglang kernel 同款保护：kernel 内 `token_mask = offs_token < num_valid_tokens`，而非 host 端 `valid = sid<M_flat`。或绕过 dcu_align 用自己的 align。
+- 解决正确性后，再攻 cuda graph 兼容（多 op 串进 graph 的问题，`.item()` 已修但 `torch.cat`/动态 pad 待验证）。
+
+**当前回退**：`SGLANG_USE_TILELANG_W4A16=0`（sglang 原生 Triton int4）+ `--cuda-graph-max-bs 8`。tilelang 代码保留在 `quant_gemm/moe/`，补丁在 `sglang_patches/modified/fused_moe.py`（环境变量控制，默认关，不影响原生）。

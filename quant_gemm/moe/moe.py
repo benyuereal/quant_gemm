@@ -117,10 +117,9 @@ def tilelang_fused_moe_simple(
     total_pad = sorted_ids.numel()
     num_m_blocks = expert_ids.numel()
 
-    # 有效 block 数 = ceil(num_tokens_post_padded / block_M). 超出的 block 是 padding, 跳过.
+    # num_tokens_post_padded 传 kernel (kernel 内算 num_valid_blocks = ceildiv(ntp, block_M)).
     ntp_val = int(num_tokens_post_padded.item()) if torch.is_tensor(num_tokens_post_padded) else int(num_tokens_post_padded)
-    num_valid_blocks = (ntp_val + block_M - 1) // block_M
-    nvb = torch.tensor([num_valid_blocks], device=dev, dtype=torch.int32)
+    ntp = torch.tensor([ntp_val], device=dev, dtype=torch.int32)
 
     # ---- 2. gather 激活 (pad 位置读 0) ----
     valid = sorted_ids < M_flat
@@ -152,7 +151,7 @@ def tilelang_fused_moe_simple(
         block_M, block_N, group_size=GROUP,
         num_stages=num_stages, threads=threads,
     )
-    cache1 = kernel1(A_gathered, w1, w1_scale, expert_ids, block_m_start, block_actual_rows, nvb)
+    cache1 = kernel1(A_gathered, w1, w1_scale, expert_ids, block_m_start, block_actual_rows, ntp)
 
     # ---- 5. silu_and_mul ----
     cache_inter = silu_and_mul(cache1.view(-1, N_gate_up))     # [total_pad, N_inter]
@@ -163,7 +162,7 @@ def tilelang_fused_moe_simple(
         block_M, block_N, group_size=GROUP,
         num_stages=num_stages, threads=threads,
     )
-    cache_down = kernel2(cache_inter, w2, w2_scale, expert_ids, block_m_start, block_actual_rows, nvb)
+    cache_down = kernel2(cache_inter, w2, w2_scale, expert_ids, block_m_start, block_actual_rows, ntp)
 
     # ---- 7. combine: w_per_row[i] = topk_weights.flatten()[sorted_ids[i]], pad 位置 0 ----
     # 只对前 ntp_val 行做 (ntp_val = 填充到 block_M 整数倍的有效区域边界).
@@ -189,17 +188,22 @@ def w4a16_fused_moe_aligned(
     expert_ids,               # [num_m_blocks] int32 (每 block 的 expert, 仅前 nvb 个有效)
     num_tokens_post_padded,   # [1] int32 (有效 token 数, 填充到 block_M 倍数边界)
     block_M=16, block_N=64, num_stages=2, threads=256,
+    routed_scaling_factor=1.0,  # M3=2.0, sglang combine 阶段会乘 (我们之前漏乘 -> 输出差 2x)
 ):
     """tilelang W4A16 fused MoE, 接收 sglang 已对齐的路由输入 (复用 sorted_token_ids 等,
-    避免重复 align). 用于替换 sglang TritonRunnerCore.run 的 int4 分支.
+    避免重复 align). 用于替换 sglang fused_experts_impl 的 int4 分支.
 
     与 tilelang_fused_moe_simple 的区别: 不内部调 dcu_moe_align_block_size, 直接用传入的
     sorted_token_ids/expert_ids/num_tokens_post_padded (sglang token_dispatcher 已算好).
 
+    **cuda graph 兼容**: 不用 .item() / 动态 slice. num_tokens_post_padded 作为 tensor 传给
+    kernel, kernel 内算 num_valid_blocks 跳过 pad 块. combine 对全 total_pad 行做 (pad 行
+    valid=False 权重 0, index_add 不影响), 不 slice [:ntp_val].
+
     输入语义 (sglang):
       sorted_token_ids[i] = 该 row 对应的 (token*topk+k) 扁平索引, pad 行 = num_tokens*topk
       expert_ids[b] = block b 的 expert id (仅前 ceil(ntp/block_M) 个有效, 后面未初始化)
-      num_tokens_post_padded = 有效 token 总数 (填充到 block_M 倍数)
+      num_tokens_post_padded = 有效 token 总数 (填充到 block_M 倍数), tensor [1]
     """
     from sgl_kernel import silu_and_mul
 
@@ -212,54 +216,62 @@ def w4a16_fused_moe_aligned(
     M_flat = num_tokens * topk
 
     sorted_ids = sorted_token_ids.to(torch.int64)
-    total_pad = sorted_ids.numel()
-    num_m_blocks = expert_ids.numel()
+    total_pad = sorted_ids.numel()          # 静态 (sorted_ids 形状固定), cuda graph 兼容
+    # grid 用 cdiv(total_pad, block_M), 与 sglang kernel 一致 (sglang grid = cdiv(sorted_ids, BLOCK_M)).
+    # 注意: sglang dcu_align 在大 M (num_tokens*topk > 阈值) 时, expert_ids 长度 << total_pad/block_M
+    # (如 M=178: eid_len=138 但 total_pad/16=549). 用 eid_len 作 grid 会少跑 block -> 乱码.
+    # 故 grid = cdiv(total_pad, block_M), expert_ids 不足部分 pad 0 (这些 block 的 A_gathered
+    # 因 sorted_ids 是 pad 值(=M_flat) -> valid=False -> A=0, GEMM 出 0, 不影响; 且 kernel
+    # early-exit bx*block_M < ntp 跳过纯 padding 块).
+    num_m_blocks = (total_pad + block_M - 1) // block_M
+    eid = expert_ids
+    if eid.numel() < num_m_blocks:
+        eid = torch.cat([eid, torch.zeros(num_m_blocks - eid.numel(), device=dev, dtype=eid.dtype)])
 
-    ntp_val = int(num_tokens_post_padded.item()) if torch.is_tensor(num_tokens_post_padded) else int(num_tokens_post_padded)
-    num_valid_blocks = (ntp_val + block_M - 1) // block_M
-    nvb = torch.tensor([num_valid_blocks], device=dev, dtype=torch.int32)
-    # C/A 行数: 防 nvb*block_M > total_pad 越界 (通常 total_pad 已够大)
-    total_rows = max(total_pad, num_valid_blocks * block_M)
+    # num_tokens_post_padded 直接传 kernel (不 .item()), kernel 内算 num_valid_blocks.
+    ntp = num_tokens_post_padded.to(torch.int32) if not torch.is_tensor(num_tokens_post_padded) \
+          else num_tokens_post_padded.to(torch.int32)
 
     # gather 激活: sorted_ids 是 (token*topk+k) 扁平索引, tok = sorted_ids // topk
-    valid = sorted_ids < M_flat
-    safe_flat = sorted_ids.clamp(max=M_flat - 1)
+    # 注意: sglang dcu_align 在小 E (如 TP=4 E=32) 时, sorted_ids 超出有效区的行是
+    # 未初始化垃圾 (大正数或负数), 不能直接用. valid mask 须同时排除负数和 >=M_flat,
+    # safe_flat 须 clamp 到 [0, M_flat-1] (负垃圾也要 clamp, 否则负索引取到错误 token).
+    valid = (sorted_ids >= 0) & (sorted_ids < M_flat)
+    safe_flat = sorted_ids.clamp(min=0, max=M_flat - 1)
     tok_idx = safe_flat // topk
     A_gathered = hidden_states[tok_idx]
     A_gathered = A_gathered * valid.unsqueeze(-1).to(DTYPE)
-    if total_rows > total_pad:
-        A_gathered = torch.cat(
-            [A_gathered, torch.zeros(total_rows - total_pad, K, device=dev, dtype=DTYPE)], dim=0,
-        )
+    # 不 cat pad: kernel early-exit (bx*block_M < ntp) 跳过 pad 块, 不读越界.
+    # total_pad (sorted_ids 长度) >= nvb*block_M 通常成立 (sglang align 保证).
 
     block_m_start = torch.arange(num_m_blocks, device=dev, dtype=torch.int32) * block_M
     block_actual_rows = torch.full((num_m_blocks,), block_M, device=dev, dtype=torch.int32)
 
     kernel1 = w4a16_grouped_gemm(
-        E, total_rows, N_gate_up, K, num_m_blocks,
+        E, total_pad, N_gate_up, K, num_m_blocks,
         block_M, block_N, group_size=GROUP,
         num_stages=num_stages, threads=threads,
     )
-    cache1 = kernel1(A_gathered, w1, w1_scale, expert_ids, block_m_start, block_actual_rows, nvb)
+    cache1 = kernel1(A_gathered, w1, w1_scale, eid, block_m_start, block_actual_rows, ntp)
     cache_inter = silu_and_mul(cache1.view(-1, N_gate_up))
 
     kernel2 = w4a16_grouped_gemm(
-        E, total_rows, N_down, N_inter, num_m_blocks,
+        E, total_pad, N_down, N_inter, num_m_blocks,
         block_M, block_N, group_size=GROUP,
         num_stages=num_stages, threads=threads,
     )
-    cache_down = kernel2(cache_inter, w2, w2_scale, expert_ids, block_m_start, block_actual_rows, nvb)
+    cache_down = kernel2(cache_inter, w2, w2_scale, eid, block_m_start, block_actual_rows, ntp)
 
-    # combine: 只对前 ntp_val 行 (含 pad 行用 valid mask 置 0 权重)
+    # combine: 对全 total_pad 行做 (不 slice, cuda graph 兼容). pad 行 valid=False 权重 0,
+    # index_add 不影响 final. ntp 之内含 pad 行 (sorted_ids==M_flat) 也由 valid mask 置 0.
+    # 乘 routed_scaling_factor (M3=2.0), 对齐 sglang combine 的 moe_sum_reduce(..., routed_scaling_factor).
     w_flat = topk_weights.reshape(-1).to(DTYPE)
-    cd_valid = cache_down[:ntp_val]
-    sf_valid = safe_flat[:ntp_val]
-    tok_valid = tok_idx[:ntp_val]
-    valid_v = valid[:ntp_val]
-    w_per_row = torch.where(valid_v, w_flat[sf_valid], torch.zeros((), device=dev, dtype=DTYPE))
-    cache_down_weighted = cd_valid * w_per_row.unsqueeze(-1)
+    w_per_row = torch.where(valid, w_flat[safe_flat], torch.zeros((), device=dev, dtype=DTYPE))
+    cache_down_weighted = cache_down * w_per_row.unsqueeze(-1)
     final = torch.zeros(num_tokens, N_down, device=dev, dtype=DTYPE)
-    final.index_add_(0, tok_valid, cache_down_weighted)
+    final.index_add_(0, tok_idx, cache_down_weighted)
+    if routed_scaling_factor != 1.0:
+        final = final * routed_scaling_factor
     return final
 
 
