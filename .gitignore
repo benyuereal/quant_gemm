@@ -6,3 +6,5 @@ build/
 dist/
 .eggs/
 *.so
+# 预编译 HIP kernel 需进仓库交付 (用户机器未必有 HIP 编译环境)
+!sglang_patches/hip_moe_w4a16/hip_moe_w4a16_dcu.so

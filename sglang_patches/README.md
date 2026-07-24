@@ -16,6 +16,7 @@
 |---|---|---|
 | `added/compressed_tensors_w8a8_int8_triton_moe.py` | **新增** | 海光 W8A8 MoE scheme, 复用 sglang 原生 Triton fused_moe kernel |
 | `added/sitecustomize.py` | **新增** | transformers 5.6.0 注册 `minimax_m3_sparse` 自定义层类型 (sglang dev 已支持 M3, transformers 未跟进, 否则 config 校验报 `Unknown layer type`) |
+| `hip_moe_w4a16/` | **新增目录** | W4A16 MoE **decode 加速** kernel (非量化步骤). 手写 HIP kernel 替换 sglang `invoke_fused_moe_kernel`, gfx928 走 `v_mmac` 快路径 (小 batch 最多 ~3x), 大 M 回落 Triton. 含源码 `.hip` / 预编译 `.so` / patch / install 脚本. 详见 `hip_moe_w4a16/README.md`. |
 | `modified/compressed_tensors.py` | 改动 | ① MoE W8A8 海光分支 raise→return 新 scheme; ② Linear W8A8 海光下走 bf16 (moe-only) |
 | `modified/schemes/__init__.py` | 改动 | 导出新 scheme |
 | `modified/int8_kernel.py` | 改动 | `per_token_quant_int8` 的 round: `tl.extra.cuda.libdevice` → `tl.extra.hip.libdevice` |
@@ -168,6 +169,45 @@ if "minimax_m3_sparse" not in _cu.ALLOWED_LAYER_TYPES:
 python3 -c "import sitecustomize, transformers.configuration_utils as c; print('minimax_m3_sparse' in c.ALLOWED_LAYER_TYPES)"
 # True
 ```
+
+> 注: 实测系统 `/usr/lib/python3.10/sitecustomize.py` (→ `/etc/python3.10/sitecustomize.py`)
+> 在 `sys.path` 中早于 `dist-packages`, 会遮蔽 `dist-packages/sitecustomize.py`.
+> 因此补丁要合并进 `/etc/python3.10/sitecustomize.py` (真正被加载的那个), 而非放 dist-packages.
+
+## 9. `hip_moe_w4a16/` — W4A16 MoE decode 加速 kernel
+
+**定位**: 这是 W4A16 量化产物的**推理加速** kernel, **不是量化步骤**. 它消费已有 int4 MoE
+权重, 在 decode 阶段用海光 `v_mmac` 指令算 GEMM, 比 sglang 原生 Triton W4A16 kernel 快
+(小 batch 最多 ~3x). 没有它 W4A16 也能跑 (走原生 Triton), 只是 decode 慢.
+
+**内容** (独立子目录, 详见 `hip_moe_w4a16/README.md`):
+- `moe_w4a16_dcu.hip` — kernel 源码. scratch LDS roundtrip 技巧: 反量化→写共享内存→
+  `ds_read_b64` 读回当 `half4_t`, 让数据落在 `v_mmac` 期望的寄存器布局.
+- `hip_moe_w4a16_dcu.so` — 预编译 fat binary (gfx928+gfx936).
+- `hip_moe_w4a16_patch.py` — monkey-patch sglang `invoke_fused_moe_kernel`. 路径三级查找
+  (`$HIP_MOE_KERNEL_DIR` → patch 自身目录 → `<site-packages>/hip_moe_w4a16/`), 不依赖工作目录.
+- `install_hip_moe_w4a16.sh` — 装到 site-packages + sitecustomize 自动加载.
+
+**架构**:
+- gfx928 (CDNA3/MI300): `v_mmac` 快路径, 性能收益所在.
+- gfx936 (CDNA2/MI200) 等: `v_mmac` 仅 gfx928 有, 其他架构走 `.hip` 源码 `#else` 标量分支,
+  能编译加载、结果正确但**无加速**. gfx936 真要加速需另写 `mfma` 版 (不在本组件范围).
+
+**安装** (推荐, 容器交付):
+```bash
+bash sglang_patches/hip_moe_w4a16/install_hip_moe_w4a16.sh
+```
+装到 `<site-packages>/hip_moe_w4a16/`, 并在 `/etc/python3.10/sitecustomize.py` 幂等追加
+`import hip_moe_w4a16_patch` (受 `SGLANG_USE_HIP_MOE_W4A16` 开关保护). 此后 `sglang serve`
+启动自动生效, 无需 PYTHONPATH.
+
+**验证**:
+```bash
+python3 -c "import sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe as fm; print(fm.invoke_fused_moe_kernel.__module__)"
+# 期望: hip_moe_w4a16_patch
+```
+
+**开关**: `SGLANG_USE_HIP_MOE_W4A16=0` 禁用, 回退原生 Triton (W4A16 仍正常).
 
 ## 启动
 

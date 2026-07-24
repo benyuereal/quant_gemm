@@ -9,8 +9,9 @@ MiniMax-M3 在海光 DCU (gfx936 / gfx928) 上的 **W8A8 / W4A16 moe-only 量化
 ```
 quant-eagle3-hygon/
 ├── sglang_patches/      # sglang 补丁 (海光 W8A8/W4A16 MoE 适配 + EAGLE3)
-│   ├── added/           #   新增 W8A8 MoE scheme (复用 sglang 原生 Triton kernel)
+│   ├── added/           #   新增 W8A8 MoE scheme + sitecustomize (注册 minimax_m3_sparse)
 │   ├── modified/        #   改动文件 + .patch (compressed_tensors/int8_kernel/sparse attn/wNa16_moe/eagle3)
+│   ├── hip_moe_w4a16/   #   W4A16 MoE decode 加速 kernel (源码 .hip + 预编译 .so + patch + install) — 非量化, 可选性能优化
 │   ├── tests/           #   EAGLE3 verify 路径字段补全单测
 │   └── README.md        #   补丁总览 + 应用方法
 ├── quantization/        # 量化脚本
@@ -47,4 +48,5 @@ quant-eagle3-hygon/
 - ✅ W8A8 moe-only: BW100 (gfx936) 量化 + sglang 适配 + forward 跑通, chat/completions 返回连贯中文
 - ✅ W4A16 moe-only: BW100 (gfx936) 量化 (225G) + sglang 加载成功 (`CompressedTensorsWNA16TritonMoE` ROCm 路径), forward/精度待测
 - ✅ EAGLE3: M3 VL 类补 target 侧接口 + sparse backend verify 字段兜底, cuda graph 下 4x 加速
+- ⚙️ hip_moe_w4a16: W4A16 MoE **decode 加速** kernel (可选, 非量化步骤). gfx928 走 `v_mmac` 快路径 (小 batch 最多 ~3x), gfx936 走标量 fallback (无加速). 关闭 (`SGLANG_USE_HIP_MOE_W4A16=0`) 不影响 W4A16 正常推理.
 - ⏳ gfx928 (K100): 待实测
