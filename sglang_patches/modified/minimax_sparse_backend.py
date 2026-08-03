@@ -49,6 +49,16 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         # Populated by init_forward_metadata* before each forward.
         self._max_seqlen_q: int = 1
         self._max_seqlen_k: int = 1
+        # Upper bound on KV length, used as fixed max_seqlen_k under cuda graph.
+        # The sparse prefill kernel allocates a `score` tensor of shape
+        # (num_heads, total_q, ceil(max_seqlen_k / block_size_k)). Under cuda
+        # graph, capture uses dummy seq_lens=1 -> max_seqlen_k~5 -> tiny score
+        # tensor; replay has real seq_lens~190 -> kernel writes past the score
+        # tensor -> HIP VMFault. Using the context-length upper bound makes the
+        # score tensor a fixed size across capture/replay (graph-safe). The
+        # extra memory is ~0.5MB/layer for verify's small total_q, and the
+        # kernel only loops over real valid_blocks (no compute waste).
+        self._max_seqlen_k_upper = int(runner.model_config.context_len)
 
         self.block_size_q = 1
         self.block_size_k = sparse_cfg["sparse_block_size"]
@@ -162,10 +172,19 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         # the scheduler adds accept_lens after). Same semantics as the eager
         # init_forward_metadata path. Without this, sparse prefill computes wrong
         # block counts and output garbles under cuda graph.
+        #
+        # IMPORTANT (cuda graph): the sparse prefill kernel allocates a `score`
+        # tensor of shape (num_heads, total_q, ceil(max_seqlen_k / block_size_k)).
+        # Under cuda graph, capture runs with dummy seq_lens=1 (fill_value), so
+        # max_seqlen_k~5 -> tiny score tensor; replay has real seq_lens~190 ->
+        # kernel writes past the score tensor -> HIP VMFault. Use the
+        # context-length upper bound so the score tensor has a fixed size across
+        # capture/replay (graph-safe). Extra memory ~0.5MB/layer for verify's
+        # small total_q; the kernel only loops over real valid_blocks (no waste).
         draft_token_num = getattr(spec_info, "draft_token_num", None)
         if forward_mode.is_target_verify() and draft_token_num is not None:
             self._max_seqlen_q = int(draft_token_num)
-            self._max_seqlen_k = int(seq_lens[:bs].max().item()) + int(draft_token_num)
+            self._max_seqlen_k = self._max_seqlen_k_upper
         else:
             self._max_seqlen_q = 1
             self._max_seqlen_k = int(seq_lens[:bs].max().item())
@@ -182,11 +201,15 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         seq_lens_cpu,
     ):
         # seq_lens_cpu is a CPU tensor – safe to call .max().item() here.
-        # Same TARGET_VERIFY fix as capture path above.
+        # Same TARGET_VERIFY fix as capture path above. Under replay, real
+        # seq_lens are restored, but we keep max_seqlen_k at the upper bound so
+        # the score tensor (allocated at capture time with this size) is not
+        # overflowed. The kernel uses real seq_lens for actual KV access; the
+        # upper-bound max_seqlen_k only sizes the score scratch buffer.
         draft_token_num = getattr(spec_info, "draft_token_num", None)
         if forward_mode.is_target_verify() and draft_token_num is not None:
             self._max_seqlen_q = int(draft_token_num)
-            self._max_seqlen_k = int(seq_lens_cpu[:bs].max().item()) + int(draft_token_num)
+            self._max_seqlen_k = self._max_seqlen_k_upper
         else:
             self._max_seqlen_q = 1
             self._max_seqlen_k = int(seq_lens_cpu[:bs].max().item())

@@ -1,0 +1,38 @@
+--- a/sglang/srt/speculative/eagle_info_v2.py	2026-08-02 00:54:34.469650785 +0800
++++ b/sglang/srt/speculative/eagle_info_v2.py	2026-08-02 01:31:59.843833004 +0800
+@@ -3,6 +3,8 @@
+ from dataclasses import dataclass
+ from typing import TYPE_CHECKING, Any
+ 
++import os
++
+ import torch
+ import torch.nn.functional as F
+ import triton
+@@ -320,6 +322,26 @@
+             target_worker.model_runner.graph_runner
+             and target_worker.model_runner.graph_runner.can_run(verify_forward_batch)
+         )
++        # MiniMax-M3 sparse attention + cuda graph fix: the sparse attention
++        # kernel has multiple dynamic-shape dependencies (score tensor sized by
++        # max_seqlen_k, output tensor by total_q, etc.) that are captured with
++        # dummy values under cuda graph and overflow on replay with real
++        # seq_lens -> HIP VMFault. Forcing target verify to eager for sparse-
++        # attention models keeps draft/draft_extend on cuda graph (the fast
++        # path) while only the target verify forward runs eager. Draft cuda
++        # graph is unaffected (draft uses triton backend, not sparse).
++        # Env EAGLE3_VERIFY_EAGER=1 to enable (default on); =0 to disable.
++        if can_run_cuda_graph and os.environ.get("EAGLE3_VERIFY_EAGER", "1") == "1":
++            try:
++                from sglang.srt.layers.attention.minimax_sparse_backend import (
++                    MiniMaxSparseAttnBackend,
++                    MiniMaxHybridAttnBackend,
++                )
++                _attn = target_worker.model_runner.attn_backend
++                if isinstance(_attn, (MiniMaxSparseAttnBackend, MiniMaxHybridAttnBackend)):
++                    can_run_cuda_graph = False
++            except Exception:
++                pass
+         if can_run_cuda_graph:
+             target_worker.model_runner.graph_runner.replay_prepare(verify_forward_batch)
+         else:

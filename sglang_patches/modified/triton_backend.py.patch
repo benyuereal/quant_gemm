@@ -1,0 +1,55 @@
+--- a/sglang/srt/layers/attention/triton_backend.py	2026-08-01 17:15:19.256003970 +0800
++++ b/sglang/srt/layers/attention/triton_backend.py	2026-08-01 17:16:18.261931060 +0800
+@@ -430,6 +430,52 @@
+             num_kv_splits = None
+             attn_logits = None
+             attn_lse = None
++        elif forward_batch.forward_mode.is_draft_extend_v2():
++            # EAGLE3 V2 draft extend (eager path). Mirrors the cuda graph capture
++            # path (init_forward_metadata_capture_cuda_graph, is_draft_extend(include_v2=True)).
++            # Without this branch DRAFT_EXTEND_V2 falls into the plain-EXTEND else
++            # branch below, which builds kv_indices from extend_prefix_lens with the
++            # wrong layout and causes a HIP VMFault (out-of-bounds KV access) that
++            # crashes the draft worker. V2's spec_info (EagleDraftInput + V2 mixin)
++            # has no generate_attn_arg_prefill, so build attn args directly like the
++            # graph path: qo_indptr is a uniform arange of num_draft_tokens,
++            # kv_indptr = cumsum(seq_lens) (seq_lens already = prefix + draft here,
++            # set in prepare_for_extend_to_fill_draft_kvcache), kv_indices filled
++            # from req_to_token via create_flashinfer_kv_indices_triton.
++            num_tokens_per_bs = self.num_draft_tokens
++            qo_indptr = self.qo_indptr[: bs + 1]
++            qo_indptr[: bs + 1] = torch.arange(
++                0,
++                bs * num_tokens_per_bs + 1,
++                step=num_tokens_per_bs,
++                dtype=torch.int32,
++                device=self.device,
++            )
++            kv_indptr = self.kv_indptr[: bs + 1]
++            kv_indptr[1 : bs + 1] = torch.cumsum(
++                forward_batch.seq_lens, dim=0
++            )
++            kv_indptr = kv_indptr[: bs + 1]
++            kv_indices = torch.empty(
++                int(forward_batch.seq_lens.sum().item()),
++                dtype=torch.int64,
++                device=self.device,
++            )
++            create_flashinfer_kv_indices_triton[(bs,)](
++                self.req_to_token,
++                forward_batch.req_pool_indices,
++                forward_batch.seq_lens,
++                kv_indptr,
++                None,
++                kv_indices,
++                self.req_to_token.stride(0),
++            )
++            custom_mask = None
++            mask_indptr = None
++            max_extend_len = num_tokens_per_bs
++            num_kv_splits = None
++            attn_logits = None
++            attn_lse = None
+         else:
+             kv_indptr[1 : bs + 1] = torch.cumsum(
+                 forward_batch.extend_prefix_lens, dim=0
