@@ -1,0 +1,29 @@
+--- a/sglang/srt/model_executor/cuda_graph_runner.py	2026-08-02 01:17:12.179961278 +0800
++++ b/sglang/srt/model_executor/cuda_graph_runner.py	2026-08-02 01:31:59.844832986 +0800
+@@ -756,6 +756,26 @@
+         # Disable for token embedding overrides (dynamic per-request)
+         if forward_batch.replace_embeds is not None:
+             return False
++        # MiniMax-M3 sparse attention + EAGLE3 TARGET_VERIFY: the sparse
++        # attention kernel has dynamic-shape dependencies (score tensor sized
++        # by max_seqlen_k, etc.) that are captured with dummy seq_lens under
++        # cuda graph and overflow on replay -> HIP VMFault. Force target verify
++        # to eager for sparse-attention models. Draft cuda graph is unaffected
++        # (draft uses triton backend). Env EAGLE3_VERIFY_EAGER=1 (default on).
++        if (
++            forward_batch.forward_mode.is_target_verify()
++            and os.environ.get("EAGLE3_VERIFY_EAGER", "1") == "1"
++        ):
++            try:
++                from sglang.srt.layers.attention.minimax_sparse_backend import (
++                    MiniMaxSparseAttnBackend,
++                    MiniMaxHybridAttnBackend,
++                )
++                _attn = self.model_runner.attn_backend
++                if isinstance(_attn, (MiniMaxSparseAttnBackend, MiniMaxHybridAttnBackend)):
++                    return False
++            except Exception:
++                pass
+         if self.require_mlp_tp_gather:
+             cuda_graph_bs = (
+                 max(forward_batch.global_num_tokens_cpu) // self.num_tokens_per_bs
